@@ -1,6 +1,6 @@
 # Personal Finance Tracking System - Professional Blueprint
 
-Version 1.0 | Scope: Single-user, India-centric (UPI / GPay / CRED / credit cards / Amazon Pay) | Constraint: 100% free tooling
+Version 1.1 | Scope: Single-user, India-centric (UPI / GPay / CRED / credit cards / Amazon Pay) | Constraint: 100% free tooling
 
 ---
 
@@ -111,6 +111,20 @@ Each field also gets a **confidence score**. Raw text is always retained next to
 - Counterparty -> lowercase, strip `UPI/`, strip prefixes/suffixes like `Paytm Payments Bank` -> alias map (`PAYTM`, `PayTM`, `paytm` all -> `paytm`).
 - Reference -> kept verbatim (UTR is case-sensitive in matching).
 
+### 5.3 AI-Assisted Layer (optional enhancement, not the foundation)
+Deterministic rules handle the high-volume, well-formed 90% (SMS/UTR parsing, CSV columns). Reserve AI for the messy 10%:
+
+- **Telegram natural-language entry**: `dinner 450 sam` -> `{amount: 450, merchant: sam, category: food, shared: true}`. When you would have to type structured fields, AI parses free text into the schema.
+- **Ambiguous categorization**: low-confidence or unmatched entries get an AI-suggested category that you confirm in chat (never silently applied).
+- **Exception queue triage**: unmatched/flagged transactions routed to AI for a suggested explanation.
+- **Monthly narration**: "You spent 14% more on food this month" style report summaries.
+
+Free execution options, in order of privacy:
+1. **Local Ollama model** (free, fully private - financial data never leaves your machine). Best for Option A (self-hosted).
+2. **Bring-your-own free-tier API** for Option B (Apps Script calls an LLM endpoint via `UrlFetchApp`). Data goes to that provider - only send anonymized, merchant-level data, never full account/card numbers or OTPs.
+
+Rule: the deterministic path must always work standalone. If AI is unavailable, the system degrades to rules + your Telegram confirmation - never to silent wrong data.
+
 ---
 
 ## 6. Deduplication Engine (The Core)
@@ -146,23 +160,42 @@ For an incoming record, query candidates by: same `type`, same amount, date with
 
 | Outcome | Decision | Action |
 |---------|----------|--------|
-| EXACT | UTR hit | Auto-merge duplicate, log mapping to canonical, discard copy |
-| STRONG | key_soft hit + merchant similar + unique in window | Auto-merge, enrich canonical with missing fields (e.g., PDF fills in merchant category) |
-| WEAK | fuzzy score in mid band, or multiple same-day candidates | Queue to Telegram: "Duplicate of Rs 450 at Zomato on 08 Aug? [Merge] [No]" |
-| NEW | no match | Insert, then trigger the classification feedback loop |
+| EXACT | UTR/ID hit (Tier 1) | Auto-merge duplicate, log mapping to canonical, add source alias, discard copy |
+| STRONG | key_soft hit + merchant similar + unique in window (Tier 2) | Auto-merge, enrich canonical with missing fields, add source alias |
+| WEAK / needs_review | fuzzy score in mid band, or multiple same-day candidates, or a Tier 2 match that is not exact on the ID | **Never silently merge.** Queue to Telegram: "Duplicate of Rs 450 at Zomato on 08 Aug? [Merge] [No]" |
+| NEW | no match | Insert row (status = pending), then trigger the classification feedback loop |
+
+### 6.4 Confidence ladder (provisional -> confirmed -> verified)
+Mirrors banking reconciliation semantics (provisional vs final):
+
+| Status | Meaning | How it is reached |
+|--------|---------|-------------------|
+| `pending` | Single source, unconfirmed | One SMS or one PDF line only |
+| `confirmed` | Corroborated by 2+ independent sources, OR you acknowledged it in the Telegram loop | SMS + email, SMS + CSV, or your "yes" tap |
+| `verified` | Reconciled against the bank statement total | Monthly reconciliation (Section 8) passed |
+
+The confidence ladder feeds reports: only `confirmed`/`verified` rows count toward hard numbers; `pending` rows show as "provisional". This is the same discipline a risk desk applies - nothing is final until corroborated or reconciled.
 
 ### 6.4 Channel priority (who is the canonical copy)
 When merging, the highest-priority channel's record becomes canonical and missing fields are filled from lower-priority records:
 
 SMS (5) > Email alert (4) > Telegram manual (3) > UPI-app CSV (2) > PDF (1)
 
-### 6.5 Reconciliation closes the gaps the fuzzy matcher can't
+### 6.5 Channel priority (who is the canonical copy)
+When merging, the highest-priority channel's record becomes canonical and missing fields are filled from lower-priority records:
+
+SMS (5) > Email alert (4) > Telegram manual (3) > UPI-app CSV (2) > PDF (1)
+
+Every corroborating source is recorded as an **alias** on the canonical row (e.g. `sources: [sms, email, gpay_pdf]`). This proves the merge happened and drives the confidence ladder.
+
+### 6.6 Reconciliation closes the gaps the fuzzy matcher can't
 A UTR-less, out-of-window duplicate (email-only txn that also shows up in the PDF two months later) is caught by **monthly reconciliation** (Section 8), not by windowed fuzzy matching. This is the deliberate design: fuzzy matching stays narrow to avoid false merges, and the statement-based reconciliation is the long-term safety net.
 
-### 6.6 Dedup KPIs
+### 6.7 Dedup KPIs
 - Duplicate auto-catch rate (target > 95% via UTR)
 - False-merge rate (must stay ~0%; every suspected merge with ambiguity is sent to the human)
 - Capture rate = recorded / bank statement transactions (target > 98%)
+- `needs_review` queue drain rate (target: cleared within 48h)
 
 ---
 
@@ -280,6 +313,18 @@ Every decision goes through a confirmable action, so:
 18. **Rewards / cashback as credits (CRED, GPay)**: rewards redeemed land as small `CREDIT`s. Auto-route to a `rewards` category, never to income and never mistaken for a reimbursement.
 19. **Card payment vs card spend**: paying your credit card bill via CRED/UPI is a **liability settlement** (account transfer), not spending. It must be excluded from spend categories or the monthly "spend" is massively inflated. This is a top-3 trap in the CRED/Amazon Pay/Slice set.
 20. **Top-ups to wallets (Amazon Pay balance, GPay)**: moving money into a wallet is also a transfer, not spend; the actual spend is the wallet debit later. Tag both sides so neither is double-counted.
+21. **Failed / declined / reversed transactions**: a UPI debit that fails then reverses, or a card authorization that drops off, must be **excluded or netted**, never counted as spend. Track a `FAILED` / `REVERSED` state; the reversal of a debit nets against it. This is the biggest source of phantom spend in naive trackers.
+22. **Three distinct credit types - never conflate them**:
+    | Credit type | Meaning | Handling |
+    |-------------|---------|----------|
+    | Refund | Merchant returns part of an expense | Nets against the original expense (reduces spend) |
+    | Reimbursement | Friend/group repays your shared expense | Closes a receivable (Section 7), never income |
+    | Income | Salary, interest, etc. | The only type that counts as income |
+    The model must tell them apart before any credit is bucketed.
+23. **Bill-level grouping**: one restaurant bill paid 3 ways (your card + friend's UPI + cash) is one **logical expense** with multiple raw transactions. Need a `bill_id` grouping level above transactions, so reports show "Dinner: Rs 1200" once, not three fragments.
+24. **Multi-account self-transfers**: savings -> wallet -> card repayment are transfers, not expense/income. Detect same-owner accounts and exclude from spend; the system tracks them only for balance verification.
+25. **Source format drift**: banks change SMS/email templates and GPay changes export formats. Any parsing failure must land in the **unmatched/exception queue** with an alert to you - never silently corrupt or drop data. A parser version field on each record makes drift diagnosable.
+26. **Backdated / late entries**: event-sourcing style - a PDF arriving 40 days late must be attributed to its transaction date, not today, and all aggregates recomputed idempotently from raw events. Never store pre-computed running totals that a late entry can corrupt.
 
 ---
 
@@ -290,6 +335,7 @@ Every decision goes through a confirmable action, so:
 ### Option A - Self-hosted N8N (recommended; most power)
 - **Host**: Oracle Cloud **Always Free** ARM VM (4 OCPU / 24 GB RAM) or a home Raspberry Pi. (Railway/Render free tiers sleep and break real-time SMS ingestion - avoid.)
 - **Automation**: N8N (self-hosted, OSS, free forever). Webhook + email + Telegram + scheduler nodes cover everything.
+- **AI**: native **AI Agent node** (LangChain-based) + **AI Transform node** (natural-language parsing) built into Community Edition, free. Run a **local Ollama model** so financial data never leaves your machine.
 - **Database**: PostgreSQL (or SQLite for simplicity) on the same box.
 - **SMS**: SMS Forwarder app -> N8N webhook.
 - **Email**: N8N IMAP trigger on Gmail.
@@ -314,16 +360,16 @@ Every decision goes through a confirmable action, so:
 
 ### 11.4 Recommendation (for this user)
 
-Start with **Option B (Google zero-server)**, and treat Option A as a later upgrade. Reasoning:
+The previous session's AI angle changes the calculus: the **AI Agent/Transform nodes, local Ollama, native PDF parsing, and one-tool automation** all live in N8N. If you can manage a free VM, **Option A (N8N self-hosted) is now the primary recommendation** - it is the only option with a private, free, native AI path, and it removes the Apps Script PDF weakness.
 
-1. **Zero maintenance, zero bill-shock risk.** Apps Script and Sheets have no billing risk, no server to patch, and no Oracle Cloud account that could be reclaimed or misconfigured into a paid tier. For a single-user personal system this matters more than raw power.
-2. **Your workload fits the quotas.** Personal ingestion is a few hundred messages a month; Apps Script's ~20k executions/day and 6-minute cap per run are far beyond that.
-3. **Real-time is achievable.** SMS Forwarder can push to a published Apps Script webhook (`doPost`) and Gmail triggers are near-real-time, so the "SMS first, PDF later" ordering still works.
-4. **The one genuine weakness - PDF parsing - has a free workaround.** Upload PDFs to the Telegram bot; Apps Script sends them to Google Drive and runs the Drive OCR conversion to extract text. Messier than N8N's parser, but the monthly reconciliation (Section 8) only needs rough line extraction, so it is acceptable. If this proves too flaky, migrate to Option A for reconciliation only.
+Revised guidance:
 
-Timeline: run Phase 1-2 on Option B, re-evaluate after 3 months of use. If parsing quality, scale, or customization frustrates you, the N8N path (Option A) is a drop-in swap - the pipeline design is identical.
+1. **Option A (N8N + Ollama on Oracle Always Free)** if you are comfortable following a one-time server setup guide (docker, a bit of config). Best fit for the AI-assisted entry and full "pro" trajectory.
+2. **Option B (Google zero-server)** remains the zero-maintenance fallback. AI is still possible (Apps Script calls a free-tier LLM endpoint for the messy 10%), just not native and not fully private. Core deterministic tracking works perfectly either way.
 
-All three keep the Telegram feedback loop as the primary UI.
+Timeline: run Phase 1-2 on your chosen stack, re-evaluate after 3 months of use. The pipeline design is identical across all options - only the plumbing differs.
+
+All options keep the Telegram feedback loop as the primary UI.
 
 ---
 
@@ -331,7 +377,8 @@ All three keep the Telegram feedback loop as the primary UI.
 
 | Component | Free choice |
 |-----------|-------------|
-| Automation | N8N self-hosted OR Apps Script OR Cloudflare Workers |
+| Automation | N8N self-hosted (with native AI Agent/Transform nodes) OR Apps Script OR Cloudflare Workers |
+| AI | Local Ollama (private, free) OR free-tier LLM API |
 | Database | SQLite / PostgreSQL on own box / Supabase / Neon |
 | SMS intake | SMS Forwarder (open source) |
 | Email intake | Gmail |
@@ -360,10 +407,10 @@ All three keep the Telegram feedback loop as the primary UI.
 | 1. Skeleton | Choose host; stand up pipeline; SMS ingestion for one bank; raw event log + DB | SMS transactions recorded |
 | 2. Dedup | UTR key, key_soft matching, channel priority, merge logic | Zero duplicates across SMS+email for one bank |
 | 3. Feedback loop | Telegram bot: classify, shared flag, duplicate override, debounce, quiet hours | 95% of entries classified via bot |
-| 4. Shared ledger | Receivable rows, reimbursement matching, balances per person, aging | Net shared position accurate |
-| 5. Reconciliation | Monthly statement reconcile + anomaly report | Capture rate >= 98% |
-| 6. Reporting | Categorization + monthly dashboard + takeout | Full monthly report delivered |
-| 7. Hardening | More banks, OCR PDFs, multi-currency, KPIs, backups | Runs unattended for 3 months |
+| 4. Shared ledger | Receivable rows, reimbursement matching, balances per person, aging, bill-level grouping | Net shared position accurate |
+| 5. Reconciliation | Monthly statement reconcile + anomaly report + confidence ladder verified status | Capture rate >= 98% |
+| 6. Reporting | Categorization + monthly dashboard + takeout + monthly narration (AI) | Full monthly report delivered |
+| 7. Hardening | More banks, OCR PDFs, multi-currency, AI-assisted entry (Ollama), source-format-drift alerting, KPIs, backups | Runs unattended for 3 months |
 
 ---
 
@@ -371,10 +418,12 @@ All three keep the Telegram feedback loop as the primary UI.
 
 | # | Decision | Resolution |
 |---|----------|------------|
-| 1 | Hosting | Option B (Google zero-server) for MVP; Option A (N8N) as drop-in upgrade if PDF parsing or scale frustrates (Section 11.4) |
+| 1 | Hosting | **Revised**: Option A (N8N self-hosted + local Ollama on Oracle Always Free) is primary - only free option with native/private AI. Option B (Google) stays as zero-maintenance fallback (Section 11.4) |
 | 2 | First parsers | GPay, CRED, Amazon Pay, Slice. CRED/Slice/Amazon Pay Later must be treated as credit lines (Section 10.17-10.20) |
 | 3 | Shared-expense flag | Flag-only by default; if user supplies a share amount/%, system calculates the receivable from that input (Section 9.1) |
 | 4 | Reimbursement matching | Human-confirmed on Telegram first; auto-match only after the user has accepted the same pattern repeatedly |
+| 5 | AI usage | Optional enhancement for the messy 10% (free-text entry, ambiguous category, exception triage, monthly narration). Deterministic rules always work standalone (Section 5.3) |
+| 6 | Confidence model | pending -> confirmed -> verified ladder, corroboration-based, drives reports (Section 6.4) |
 
 ---
 
