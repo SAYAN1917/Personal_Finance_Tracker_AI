@@ -174,3 +174,9 @@
 *.lz
 *.lzma
 *.iso
+
+# Runtime data
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+*.log
