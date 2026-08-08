@@ -37,17 +37,17 @@ graph TD
     M --> L
     B --> N["Feedback Loop"]
     N --> L
-    N --> O["Ollama AI lane (optional)"]
+    N --> O["Cloud NLU lane (optional)"]
     O --> K
     L --> P["Reports / Metabase / Telegram"]
 ```
 
 **Component split (final):**
 - **Core API (FastAPI + SQLAlchemy)** - the brain: parsers, dedup, classification, settlements, ledger, bot commands. Runs standalone for dev (SQLite), full deployment (Postgres). This is where all correctness lives.
-- **N8N (optional, self-hosted)** - only the glue: Gmail polling trigger, statement-upload handler, scheduled daily/monthly digests. Calls the Core API's webhooks. Removes the need for any public webhook on the phone side (Section 5.4).
+- **N8N (optional, self-hosted)** - only the glue: Gmail polling trigger, statement-upload handler, scheduled daily/monthly digests. Calls the Core API's webhooks. Removes the need for any public webhook on the phone side (Section 3.2).
 - **Telegram Bot** - the only UI you touch.
 - **Metabase (optional)** - dashboards; Telegram monthly report is the zero-effort default.
-- **Ollama (optional)** - local AI for the messy 10%.
+- **AI (optional)** - a single narrow NLU node via free-tier cloud LLM API (Gemini/Groq free); no local model (Section 6.3).
 
 ---
 
@@ -230,6 +230,11 @@ KPIs: capture rate >= 98%, duplicate auto-catch > 95%, false-merge ~0%, needs_re
 24. Multi-account self-transfers: excluded from spend, tracked for balance verification.
 25. Source format drift: any parse failure -> unmatched queue + alert; parser version field per record.
 26. Backdated / late entries: attributed to txn date; aggregates recomputed idempotently.
+27. **ATM / cash withdrawals**: cash-out is a transfer to cash, not merchant spend; the ATM fee is a real expense (`fees` tag). Detect withdrawal keywords and split the fee out.
+28. **Bank fees / penalties / interest charges**: `fees` category, never spend and never income - surfaced in reconciliation so you notice creeping charges.
+29. **Proactive bill reminders**: the `recurring` table fires "Rent due in 3 days" / "Netflix due today" alerts - the tracker nudges, not just records.
+30. **Search**: `/find zomato aug` or `/find 450` from the bot - locate any past transaction quickly (index on counterparty_norm + date + amount).
+31. **System health**: a free monitor (UptimeRobot) pings `/health` and alerts to Telegram if the VM or API is down, so you notice an outage within minutes, not weeks.
 
 ---
 
@@ -238,15 +243,26 @@ KPIs: capture rate >= 98%, duplicate auto-catch > 95%, false-merge ~0%, needs_re
 | Table | Key columns | Notes |
 |-------|-------------|-------|
 | `events` | ingestion_id, source, channel, received_at, raw_payload | Immutable audit log |
-| `transactions` | id, txn_date, amount_paise, type, mode, counterparty_norm, account, utr, key_exact, key_soft, status(pending/confirmed/verified), txn_state(personal/maybe_shared/flagged_shared/resolved_shared), credit_type, category, bill_id, emi_group, sources[], parser_version, needs_review | Canonical ledger |
+| `transactions` | id, txn_date, value_date, posting_date, amount_paise, currency, fx_rate, type, mode, counterparty_norm, account, utr, key_exact, key_soft, status(pending/confirmed/verified), lifecycle(active/failed/reversed), txn_state(personal/maybe_shared/flagged_shared/resolved_shared), credit_type(refund/reimbursement/income/null), ownership(mine/not_mine), category, bill_id, emi_group, sources[], parser_version, needs_review | Canonical ledger |
+| `accounts` | id, name, type(bank/wallet/card/cash), institution, last_verified_balance_paise, last_reconciled_at | Balance source of truth; reconciliation target |
 | `dedup_map` | canonical_id, source, raw_id, matched_at | Every merge/alias |
+| `refund_links` | txn_id, original_txn_id, amount, confidence, matched_at | Refund credit linked back to original expense |
 | `group_expenses` | id, ledger_id, person/group, full_amount, share_amount, expected_receivable, received_so_far, status(open/partial/settled/written_off) | The receivable |
 | `settlements` | id, txn_id, group_expense_id, amount, kind(partial/full/overpay/cash) | Match link |
 | `persons` | id, name, vpas[], aliases[] | Known-persons list |
+| `pending_actions` | id, chat_id, step, context_json, created_at, updated_at | Multi-step bot conversations (create group expense, settle picker, etc.) |
 | `audit` | id, actor, action, entity, before, after, reason, at | Every manual edit/merge/delete |
 | `balances` | person_id, net_receivable | Derived, recomputable |
+| `recurring` | id, pattern(monthly/quarterly), expected_amount, category, merchant, last_seen_at, active | Known subscriptions/bills - pre-flag + reminders |
 
 Engine: SQLite for dev, Postgres for deploy. All aggregates are derived - never stored totals (late entries recompute idempotently).
+
+### 10.1 Refund matching (how a refund links back to the original)
+Refunds arrive as `CREDIT`s without the original UTR, so the linker is separate from dedup:
+- Candidate scan: original expense with same counterparty, amount >= refund, `lifecycle=active`, within the last 45 days.
+- Exactly one candidate -> auto-link, refund nets against it (`refund_links`).
+- Multiple candidates -> `needs_review`, you pick. None -> leave unmatched, type as `refund` anyway and reconcile later.
+- A refund of a shared expense also reduces the receivable (never income).
 
 ---
 
@@ -280,9 +296,9 @@ Deploy: single `docker-compose.yml` - Postgres + Core + N8N + Metabase. Phone an
 | 2 | Dedup engine (Tier 1 UTR, Tier 2 fingerprint, alias, needs_review) + 5.2-5.4 rules | Zero dupes across SMS+email+PDF; regression tests A-F pass |
 | 3 | Telegram bot: ingest, classify, trigger-driven shared prompt, "Create group expense", debounce/quiet hours | 95% entries handled via bot |
 | 4 | Group expenses + settlement matching (conservative rule B) + receivables + balances | Net shared position accurate |
-| 5 | Reconciliation + confidence ladder + anomaly report | Capture >= 98% |
-| 6 | Reports: categories, monthly digest, takeout | Full monthly report |
-| 7 | Hardening: credit-line/EMI tagging, more banks, OCR PDFs, NLU AI lane, format-drift alerting, KPIs, backups | Runs unattended 3 months |
+| 5 | Reconciliation + confidence ladder + anomaly report + accounts balance check + refund matching | Capture >= 98%, accounts reconcile |
+| 6 | Reports: categories, monthly digest, takeout, `/find` search, bill reminders | Full monthly report |
+| 7 | Hardening: credit-line/EMI tagging, more banks, OCR PDFs, NLU AI lane, format-drift alerting, health monitor, backups, KPIs | Runs unattended 3 months |
 
 Each phase ends with tests + a Telegram summary of what was verified.
 
@@ -290,12 +306,14 @@ Each phase ends with tests + a Telegram summary of what was verified.
 
 ## 13. Security & Privacy
 
-- SMS Forwarder filters to transaction messages only - **never OTPs**.
-- Secrets (bot token, DB creds) in env, never committed.
-- Self-host = financial data stays on your VM. The AI lane sends ONLY the free text you type into Telegram (never raw bank SMS, account numbers, balances, or UTRs) to a free-tier LLM API.
-- Encryption at rest, daily backups to your own storage.
-- Immutable audit trail for every manual action.
-- Full CSV takeout anytime.
+- **Bot allowlist**: the Telegram bot accepts commands only from your allowlisted user ID(s); anyone else is ignored (never responds, never sees data).
+- **Webhook auth**: N8N -> Core API calls carry a shared secret token; Core rejects unauthenticated requests (prevents spoofed ingests).
+- **Filter at the source**: SMS Forwarder forwards only transaction messages, **never OTPs**.
+- **Secrets** (bot token, DB creds, webhook secret): in env / docker secrets, never committed.
+- **Data residency**: raw bank feed stays on your VM. The AI lane sends ONLY the free text you type into Telegram (never raw bank SMS, account numbers, balances, or UTRs) to a free-tier LLM API.
+- **Backups (free & concrete)**: nightly `pg_dump` -> compressed -> uploaded to your **Telegram Saved Messages** (private to you) or any free cloud drive via rclone. Restore = pull latest dump, `pg_restore`.
+- **Health alerting**: UptimeRobot free tier pings `/health`; on failure it calls a Telegram alert webhook so you know within minutes.
+- **Encryption at rest**; immutable audit trail for every manual action; full CSV takeout anytime.
 
 ---
 
@@ -316,3 +334,6 @@ Each phase ends with tests + a Telegram summary of what was verified.
 | 11 | Flag != receivable; bot surfaces "Create group expense" |
 | 12 | Pipeline order: dedup -> settlement-match -> credit-type -> category |
 | 13 | Code starts only on explicit user instruction; every phase committed + pushed to this repo |
+| 14 | **Refunds**: linked back to original expense (merchant + amount + 45-day window); ambiguous -> needs_review. Refund of shared expense reduces the receivable (Section 10.1) |
+| 15 | **Bot security**: Telegram user-ID allowlist; shared-secret auth on N8N->Core webhooks; nightly encrypted backups to Telegram Saved Messages; UptimeRobot health alert (Section 13) |
+| 16 | **Accounts ledger**: per-account balances tracked and reconciled monthly, not just transactions (Section 10) |
