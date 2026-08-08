@@ -63,7 +63,7 @@ All components are free (details in Section 11).
 ### 4.1 Bank SMS (fastest signal)
 - Android app **SMS Forwarder** (free, open source) monitors the inbox for bank sender IDs (e.g., HDFCBK, VJPAY, PAYTM, ICICIB).
 - Filter ONLY transaction keywords: `spent`, `debited`, `credited`, `UPI`, `txn`, `account`. **Never forward OTP messages**.
-- Each SMS is POSTed to the ingestion webhook. The SMS carries the **UTR / UPI reference number**, which is the strongest dedup key available.
+- Each SMS is forwarded to your **Telegram bot** (SMS Forwarder supports this natively) - no public webhook, no port forwarding, no tunnel. The always-on VM polls Telegram/Gmail. The SMS carries the **UTR / UPI reference number**, which is the strongest dedup key available.
 
 ### 4.2 Bank Email (slower, richer)
 - Gmail receives bank alerts and monthly statements.
@@ -87,6 +87,15 @@ All components are free (details in Section 11).
 Every message (raw SMS text, raw email, uploaded file) is stored as an immutable event with:
 `ingestion_id, source, channel, received_at, raw_payload`.
 Nothing is dropped, even duplicates. This is the audit trail that makes every later decision explainable.
+
+### 4.7 Connectivity: phone -> Telegram -> poll (no webhook, no tunnel)
+Your phone and laptop are both behind NAT - a phone cannot "reach" your laptop. Flip the direction:
+
+- SMS Forwarder forwards bank SMS to your **Telegram bot** (native support).
+- The always-on cloud VM **polls** Telegram/Gmail with its trigger nodes (Telegram trigger and Gmail trigger both poll). No public webhook, no port forwarding, no tunnel required.
+- Your Telegram manual-entry bot talks to the same always-on instance.
+
+Result: phone and laptop can both be off; the cloud VM does all the work. Latency is "every 1-5 minutes" in polling mode - fine for a tracker. If you ever want sub-second (webhook) mode, the always-on VM's public IP + auth-token webhook covers that too.
 
 ---
 
@@ -217,7 +226,19 @@ From a BlackRock/Morgan Stanley standpoint, shared expenses are **not** ordinary
 | `SETTLED` | Receivable = 0. |
 | `WRITTEN_OFF` | Explicit decision: friend never returned it. Removed from active receivables; recorded as real personal loss. |
 
-### 7.3 Reimbursement matching
+### 7.3 Transaction state machine (tag now, compute later)
+Flagging without the share amount is not a shortcoming - it is the accurate design, because the true share often becomes knowable only at settlement (when Sam sends Rs 600, you learn your share was Rs 300). Deferred math is more accurate, not less:
+
+| Transaction state | Meaning |
+|-------------------|---------|
+| `personal` | Normal expense, done. No prompt needed. |
+| `maybe_shared` | Heuristically flagged as possibly shared; awaiting your answer. Best-effort, never blocking - if unanswered it stays here and appears in a "needs review" list. Reports still count it in gross spend. |
+| `flagged_shared` | You said Yes. Share amount **not yet known**. Full amount stays in spend until resolved. |
+| `resolved_shared` | Share computed at settlement: `full - received = your_share`. Report recomputes to net automatically. |
+
+Deferred math is safe because the ledger is event-sourced: `flagged_shared` keeps the full amount in spend; the moment a matching inbound closes it, all aggregates recompute idempotently to net (Section 10.26). This also powers an **"in-flight shared spend"** dashboard figure - money you have spent that others will repay.
+
+### 7.4 Reimbursement matching
 - An incoming `CREDIT` triggers the bot: "Rs 500 received from Ravi. Reimbursement? [Yes] [No]".
 - If Yes -> match against open shared expenses from that person/group. Handles:
   - Partial reimbursement
@@ -226,7 +247,7 @@ From a BlackRock/Morgan Stanley standpoint, shared expenses are **not** ordinary
   - Cash reimbursement (manual entry; flag as "received offline")
 - Net position per person/group: `sum(expected_receivable) - sum(received)` -> a clean "who owes me / I owe" balance.
 
-### 7.4 Edge cases in the shared ledger (banker's review)
+### 7.5 Edge cases in the shared ledger (banker's review)
 - **Aging of receivables**: report shows how long each receivable has been open; reminders fire after configurable periods (e.g., 7 / 30 / 60 days).
 - **Over-payment**: friend sends more than the flagged share -> excess goes to a `prepaid` balance against that group, applied to future shared expenses.
 - **Multi-person splits**: optional `split_of` group field; default share suggestion = 1/N, but the user can keep it as flag-only (no calculation) until settlement time.
@@ -253,36 +274,44 @@ This is the system's ultimate integrity check and closes every dedup gap left op
 
 Validated: a human-in-the-loop classification stage is the right call. It solves classification AND acts as a final dedup/attribution safety net.
 
-### 9.1 New-entry prompt
-After dedup confirms `NEW`, the bot asks:
+### 9.1 Trigger-driven prompt (not universal)
+Asking about every transaction is friction and users ignore it within a week. The loop is **trigger-driven**: prompt only when a heuristic suspects shared:
+
+- **Odd / non-rounded amounts** (Rs 749, Rs 2,367) - typical of split bills
+- **Counterparty is a known person** (your friends/group list from prior settlements)
+- **Category is naturally shared** (restaurants, groceries, group trips, hotels, fuel, movie tickets)
+- **Amount above a threshold** (e.g., Rs 500) where split likelihood matters
+- **Inbound settlements** matching a prior outflow
+
+Everything else is auto-accepted as `personal` with zero prompts. (Configurable toggle: "ask me about everything" for the first weeks if you prefer - see Decisions Log #5.)
+
+When triggered, the bot sends a non-blocking inline keyboard:
 
 ```
-New expense: Rs 450 at Zomato on 08 Aug 10:32.
-[Personal] [Shared] [Split] [Not mine] [Duplicate] [Skip]
+Rs 900 at Olive Bar (dinner) - Shared expense?  [Yes] [No]
 ```
 
-- **Personal** -> default category guess applied, stored as personal.
-- **Shared** -> marks `is_shared`, opens a receivable row. **Flag-only by default** (no split calculation), per your preference. If you provide a share amount or percentage (e.g. typing `shared 50%` or `shared 200`), the system calculates `expected_receivable` immediately from that input. Optionally asks "with whom?" (free text).
-- **Split** -> like Shared but always requires a share input at flag time (for users who want netting up front).
-- **Not mine** -> archived (e.g., a family member's transaction on a shared card).
-- **Duplicate** -> manual duplicate override; can also merge a `WEAK` candidate you previously skipped.
-- **Skip** -> defer; default to Personal after 24h (configurable) and note it in the report.
+- **Yes** -> `flagged_shared`. No math asked. Later, when Rs 600 inbound from Sam is seen, the bot asks "Sam paid you Rs 600 - settlement for Olive Bar (Rs 900)? [Confirm] [No]". On confirm -> your share = 300, receivable closed, reports recompute.
+- **No** -> `personal`. Done.
 
-### 9.2 Debouncing (SMS floods)
+### 9.2 Idempotent confirmations
+The prompt carries the transaction's **dedup key**. If the same txn arrives via SMS and later via PDF, you answer once and the merge applies your flag to the single canonical row - never a second prompt.
+
+### 9.3 Debouncing (SMS floods)
 SMS forwarders often dump several messages at once. Requests are batched: collect for ~60 seconds, then send one message with inline buttons for up to 5 transactions. No notification spam.
 
-### 9.3 Quiet hours
-No pings between 23:00 and 07:00; entries queue and are asked the next morning.
+### 9.4 Quiet hours + auto-snooze
+No pings between 23:00 and 07:00; entries queue and are asked the next morning. If you consistently ignore prompts, the system auto-snoozes to fewer, batched prompts rather than spamming.
 
-### 9.4 Reimbursement prompt
-On incoming credits (Section 7.3). Supports matching and partial settlements.
+### 9.5 Reimbursement prompt
+On incoming credits (Section 7.4). Supports matching and partial settlements.
 
-### 9.5 Digests
+### 9.6 Digests
 - **Daily**: "3 expenses categorized, 1 flagged shared."
 - **Weekly**: spend by category, open receivables.
 - **Monthly**: full report + reconciliation summary.
 
-### 9.6 Why this makes the system more accurate, not just nicer
+### 9.7 Why this makes the system more accurate, not just nicer
 Every decision goes through a confirmable action, so:
 - Ambiguous dedup gets a human override.
 - Shared flags are created at point of spend (when memory is fresh), not reconstructed weeks later.
@@ -333,15 +362,15 @@ Every decision goes through a confirmable action, so:
 > Decision (user-confirmed): first parsers target GPay, CRED, Amazon Pay, Slice. Hosting recommendation in Section 11.4.
 
 ### Option A - Self-hosted N8N (recommended; most power)
-- **Host**: Oracle Cloud **Always Free** ARM VM (4 OCPU / 24 GB RAM) or a home Raspberry Pi. (Railway/Render free tiers sleep and break real-time SMS ingestion - avoid.)
-- **Automation**: N8N (self-hosted, OSS, free forever). Webhook + email + Telegram + scheduler nodes cover everything.
+- **Host**: Oracle Cloud **Always Free** ARM VM (4 OCPU / 24 GB RAM) or **Google Cloud e2-micro free tier** (1 small always-on VM, fine for N8N) or a home Raspberry Pi. (Railway/Render free tiers sleep and break real-time ingestion - good for a demo, not a tracker. Fly.io free allowance has limited monthly hours.)
+- **Automation**: N8N (self-hosted, OSS, free forever). Telegram/Gmail trigger nodes **poll** - no public webhook needed for the phone side.
 - **AI**: native **AI Agent node** (LangChain-based) + **AI Transform node** (natural-language parsing) built into Community Edition, free. Run a **local Ollama model** so financial data never leaves your machine.
 - **Database**: PostgreSQL (or SQLite for simplicity) on the same box.
-- **SMS**: SMS Forwarder app -> N8N webhook.
+- **SMS**: SMS Forwarder app -> Telegram bot (native) -> N8N polls Telegram.
 - **Email**: N8N IMAP trigger on Gmail.
 - **PDF/CSV**: Telegram bot -> N8N parser (PDF text extraction / Tesseract OCR).
 - **Dashboard**: Grafana or Metabase (OSS) or Telegram reports only.
-- **Cost**: Rs 0. Time cost: initial setup + light maintenance.
+- **Cost**: Rs 0. Time cost: initial setup (~1hr) + light maintenance.
 
 ### Option B - Zero-server Google stack (simplest, zero maintenance)
 - **Automation**: Google Apps Script (free, runs on triggers).
@@ -360,11 +389,11 @@ Every decision goes through a confirmable action, so:
 
 ### 11.4 Recommendation (for this user)
 
-The previous session's AI angle changes the calculus: the **AI Agent/Transform nodes, local Ollama, native PDF parsing, and one-tool automation** all live in N8N. If you can manage a free VM, **Option A (N8N self-hosted) is now the primary recommendation** - it is the only option with a private, free, native AI path, and it removes the Apps Script PDF weakness.
+The previous sessions changed the calculus in two ways: the **AI Agent/Transform nodes, local Ollama, native PDF parsing, and one-tool automation** all live in N8N, and the **phone -> Telegram -> poll** pattern (Section 4.7) removes the need for a public webhook entirely. If you can manage a free VM, **Option A (N8N self-hosted) is now the primary recommendation** - it is the only option with a private, free, native AI path, always-on, and it removes the Apps Script PDF weakness.
 
 Revised guidance:
 
-1. **Option A (N8N + Ollama on Oracle Always Free)** if you are comfortable following a one-time server setup guide (docker, a bit of config). Best fit for the AI-assisted entry and full "pro" trajectory.
+1. **Option A (N8N + Ollama on Oracle Always Free / Google Cloud e2-micro)** if you are comfortable following a one-time server setup guide (docker, a bit of config). Best fit for the AI-assisted entry and full "pro" trajectory. Phone and laptop can both be off; the cloud VM does all the work.
 2. **Option B (Google zero-server)** remains the zero-maintenance fallback. AI is still possible (Apps Script calls a free-tier LLM endpoint for the messy 10%), just not native and not fully private. Core deterministic tracking works perfectly either way.
 
 Timeline: run Phase 1-2 on your chosen stack, re-evaluate after 3 months of use. The pipeline design is identical across all options - only the plumbing differs.
@@ -424,6 +453,10 @@ All options keep the Telegram feedback loop as the primary UI.
 | 4 | Reimbursement matching | Human-confirmed on Telegram first; auto-match only after the user has accepted the same pattern repeatedly |
 | 5 | AI usage | Optional enhancement for the messy 10% (free-text entry, ambiguous category, exception triage, monthly narration). Deterministic rules always work standalone (Section 5.3) |
 | 6 | Confidence model | pending -> confirmed -> verified ladder, corroboration-based, drives reports (Section 6.4) |
+| 7 | Shared-expense prompting | **Trigger-driven**, not universal: prompt only on heuristic suspects (odd amounts, known persons, shared categories, high value, inbound settlements). Configurable toggle for "ask me about everything" (Section 9.1) |
+| 8 | Shared state machine | personal -> maybe_shared -> flagged_shared -> resolved_shared; deferred math at settlement (Section 7.3) |
+| 9 | Connectivity | phone -> Telegram -> poll on always-on VM. No public webhook, no port forwarding, no tunnel (Section 4.7) |
+| 10 | Transaction states | `FAILED`/`REVERSED` excluded or netted; three credit types (refund/reimbursement/income) never conflated (Section 10.21-10.22) |
 
 ---
 
