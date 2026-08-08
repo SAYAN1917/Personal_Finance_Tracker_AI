@@ -457,6 +457,8 @@ All options keep the Telegram feedback loop as the primary UI.
 | 8 | Shared state machine | personal -> maybe_shared -> flagged_shared -> resolved_shared; deferred math at settlement (Section 7.3) |
 | 9 | Connectivity | phone -> Telegram -> poll on always-on VM. No public webhook, no port forwarding, no tunnel (Section 4.7) |
 | 10 | Transaction states | `FAILED`/`REVERSED` excluded or netted; three credit types (refund/reimbursement/income) never conflated (Section 10.21-10.22) |
+| 11 | Flagged-shared vs receivable | Flagging shared != creating a receivable. Settlement matcher only matches an actual `group_expense` record - safer than auto-matching flagged txns (prevents false positives). In the bot, "Yes, shared" must surface a "Create group expense" action (Section 17.2) |
+| 12 | Classification pipeline order | dedup -> settlement-match -> credit-type -> category. Inbound person credits are typed (reimbursement/refund/income) BEFORE any spend category is applied (Section 17.3) |
 
 ---
 
@@ -465,3 +467,33 @@ All options keep the Telegram feedback loop as the primary UI.
 - **How are duplicate entries prevented across SMS/email/PDF/Telegram?** Layered matching: UTR-based exact key (forever, across all channels), soft key + fuzzy within a short window, human override for ambiguity, and monthly reconciliation as the long-tail safety net. Channel priority decides the canonical copy. Nothing is deleted - all duplicates are linked and archived.
 - **How is the "shared expense" feedback loop handled?** Validated as the right approach. New entries are asked about on Telegram (debounced, quiet-hours aware). Yes = flag, no calculation needed. Money coming back later is matched as a receivable reduction. A clearing-account model keeps "who owes me" accurate and never treats reimbursements as income.
 - **Is the plan fully professional?** Yes - it includes an immutable audit trail, reconciliation with the bank as the source of truth, aging and write-off handling for receivables, fraud/anomaly detection, paise-level precision, per-field confidence scoring, and KPIs for capture/duplicate/classification quality.
+
+---
+
+## 17. Implementation Review (prototype validated via live smoke test)
+
+A working prototype (FastAPI + Telegram bot) was built and verified end-to-end:
+
+| Step | Result |
+|------|--------|
+| 1. UPI SMS ingest | Auto-ingested, `pending` |
+| 2. Same txn via email | Deduped as duplicate via UTR match |
+| 3. PDF export, no UTR | Merged via merchant+amount+date fingerprint |
+| 4. Shared prompt = Yes | Flagged `flagged_shared` |
+| 5. Friend pays Rs 600 back | Auto-matched -> reclassified as reimbursement (not income); your share = Rs 300 |
+| 6. Rs 450 below threshold | No shared prompt (minimal-friction rule works) |
+
+### 17.1 Bug found & fixed: substring regex false positives
+`ravi@ybl` was classified as category `bills` because the regex `vi\b` matched inside the word "ravi" (the brand "Vi" telecom rule fired on a person's VPA). Fix: use whole-word anchors `\bvi\b` and prefer the known-persons list before category regexes. Lesson for the classifier: **always match person/merchant identity first, category keywords second, and use token boundaries on both sides**.
+
+### 17.2 Flagging shared is not creating a receivable
+In the smoke test, step 4 flagged the ledger row but created no `group_expense`, so step 5's settlement did not match. This is **correct, safe behavior**: auto-matching flagged txns to inbound settlements could create false positives (a genuine income that merely resembles a flagged amount). The bot must therefore surface a "Create group expense" action immediately after "Yes, shared" - that is what makes the receivable real and matchable. This is an explicit UX requirement, not a gap.
+
+### 17.3 Classification pipeline order matters (credit typing before category)
+The smoke test classified `ravi@ybl` (an inbound settlement) into a spend category before trying settlement matching. Correct order is:
+
+```
+dedup -> settlement-match -> credit-type (reimbursement/refund/income) -> category
+```
+
+Inbound credits from known persons must be typed as reimbursement candidates **first**; a spend category should never be applied to money coming in. This prevents a reimbursement from polluting spend reports.
