@@ -144,8 +144,21 @@ Money coming **in** is typed first: `reimbursement`, `refund`, `income` - only `
 3. Keyword regex last - always with **whole-word anchors on both sides** (`\bvi\b`, never `vi\b` which matches inside "ravi").
 4. Non-rounded amounts, known persons, shared categories, or amounts above threshold -> trigger the shared prompt (Section 7).
 
-### 6.3 AI lane (optional, never required)
-Ollama locally (or free-tier API for Option B) handles only: free-text Telegram entry (`dinner 450 sam`), ambiguous categories (you confirm), exception triage, monthly narration. Deterministic rules always work standalone; if AI is down, degrade to rules + your confirmation - never silent wrong data.
+### 6.3 AI lane - a single narrow NLU node (cloud free tier, no local model)
+AI's only job is **understanding user input** - the task that is genuinely easier for AI than code:
+
+- `dinner 450 sam` -> `{amount: 450, merchant: sam, category: food}`
+- `group dinner 900 share 300` -> create group expense with share
+- `received 500 from ravi for dinner` -> settlement intent
+- `add 200 to emi` -> emi_group tag
+
+Implementation choices:
+- **Model: free-tier cloud LLM API** (Google Gemini free tier or Groq free tier) - no Ollama, no local hardware burden. Personal usage fits the free quota easily.
+- **Privacy contract:** the LLM sees ONLY the free text you type into Telegram plus an allowlist of your categories/persons. It NEVER sees raw bank SMS, account/card numbers, balances, or UTRs. Merchant name + amount is not sensitive; the raw bank feed stays entirely on your VM.
+- **Strict output:** the model returns JSON against a fixed schema; a validation step rejects malformed output and falls back to the deterministic parser + your confirmation. AI failure = graceful degradation to rules, never silent wrong data.
+- **Deterministic core is untouched:** UTR extraction, dedup, settlement matching, and category enforcement stay in code. The LLM never "corrects" a UTR or merges transactions - that is silent ledger corruption.
+
+Everything else (dedup, classification of known merchants, settlements, reconciliation) remains deterministic rules - the system works 100% without the AI lane.
 
 ---
 
@@ -248,7 +261,7 @@ Engine: SQLite for dev, Postgres for deploy. All aggregates are derived - never 
 | Bot | Telegram Bot API | Rs 0 |
 | Host | Oracle Cloud **Always Free** ARM (4 OCPU / 24 GB) or Google Cloud e2-micro free | Rs 0 |
 | Dashboards | Metabase or Telegram monthly report | Rs 0 |
-| AI (optional) | Ollama local (private) | Rs 0 |
+| AI (optional) | Free-tier cloud LLM API (Gemini free / Groq free) - NLU only, no local model | Rs 0 |
 | SMS intake | SMS Forwarder (open source) | Rs 0 |
 
 ### Fallback (zero infra)
@@ -269,7 +282,7 @@ Deploy: single `docker-compose.yml` - Postgres + Core + N8N + Metabase. Phone an
 | 4 | Group expenses + settlement matching (conservative rule B) + receivables + balances | Net shared position accurate |
 | 5 | Reconciliation + confidence ladder + anomaly report | Capture >= 98% |
 | 6 | Reports: categories, monthly digest, takeout | Full monthly report |
-| 7 | Hardening: credit-line/EMI tagging, more banks, OCR PDFs, Ollama lane, format-drift alerting, KPIs, backups | Runs unattended 3 months |
+| 7 | Hardening: credit-line/EMI tagging, more banks, OCR PDFs, NLU AI lane, format-drift alerting, KPIs, backups | Runs unattended 3 months |
 
 Each phase ends with tests + a Telegram summary of what was verified.
 
@@ -279,7 +292,7 @@ Each phase ends with tests + a Telegram summary of what was verified.
 
 - SMS Forwarder filters to transaction messages only - **never OTPs**.
 - Secrets (bot token, DB creds) in env, never committed.
-- Self-host = financial data stays on your VM; AI (Ollama) runs local, data never leaves.
+- Self-host = financial data stays on your VM. The AI lane sends ONLY the free text you type into Telegram (never raw bank SMS, account numbers, balances, or UTRs) to a free-tier LLM API.
 - Encryption at rest, daily backups to your own storage.
 - Immutable audit trail for every manual action.
 - Full CSV takeout anytime.
@@ -294,7 +307,7 @@ Each phase ends with tests + a Telegram summary of what was verified.
 | 2 | First parsers: one bank + GPay, then CRED / Amazon Pay / Slice (as credit lines) |
 | 3 | Shared flag: flag-only by default; share% or amount calculated if you supply it at flag time |
 | 4 | Settlement: human-confirmed; auto-match only when exactly one candidate or known-person sender |
-| 5 | AI: optional messy-10% lane; deterministic rules always standalone |
+| 5 | AI: single narrow NLU node (free-text -> structured JSON) on free-tier cloud API (Gemini/Groq). No local Ollama. LLM never sees raw bank data; deterministic core always works standalone (Section 6.3) |
 | 6 | Confidence: pending -> confirmed -> verified |
 | 7 | Prompting: trigger-driven; "ask everything" toggle available |
 | 8 | State machine: personal -> maybe_shared -> flagged_shared -> resolved_shared |
