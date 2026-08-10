@@ -30,6 +30,13 @@ class SettleRequest(BaseModel):
     """Amount to apply against the receivable, in paise. Defaults to txn amount."""
 
 
+class ReconcileRequest(BaseModel):
+    account: str
+    statement_balance_paise: int
+    """Current balance shown by the bank. Positive = money at hand."""
+    as_of: datetime | None = None
+
+
 class ConfirmMergeRequest(BaseModel):
     incoming_id: int
     canonical_id: int

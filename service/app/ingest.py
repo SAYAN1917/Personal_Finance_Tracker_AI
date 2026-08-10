@@ -29,12 +29,14 @@ class IngestResult:
         message: str = "",
         needs_review: bool = False,
         settlement_candidate: models.GroupExpense | None = None,
+        refund_link: int | None = None,
     ):
         self.outcome = outcome  # NEW / EXACT / STRONG / WEAK / FAILED
         self.transaction = transaction
         self.message = message
         self.needs_review = needs_review
         self.settlement_candidate = settlement_candidate
+        self.refund_link = refund_link
 
 
 def log_event(session, source: str, text: str, channel: str = "") -> models.Event:
@@ -162,7 +164,11 @@ def _classify_new(session, parsed: ParsedTxn, txn: models.Transaction, result: I
 
 
 def _handle_inbound_credit(session, parsed, txn, channel, result: IngestResult):
-    """Inbound credits are checked against open group expenses FIRST."""
+    """Inbound credits: settlement-match FIRST, then refund-match (Section 6).
+
+    Pipeline order is a rule: settlement-match -> credit-type -> category.
+    Settlement wins over refund when both match.
+    """
     if parsed.txn_type != "credit":
         return
 
@@ -174,3 +180,17 @@ def _handle_inbound_credit(session, parsed, txn, channel, result: IngestResult):
             f"Incoming credit possibly settles group expense #{candidate.id} "
             f"({candidate.person}) - confirm"
         )
+        return
+
+    # No settlement match - check refund (merchant + amount + 45-day window)
+    from app.refunds import link_refund, suggest_refund
+
+    refund_original = suggest_refund(session, txn)
+    if refund_original:
+        link_refund(session, txn, refund_original)
+        txn.status = "confirmed"
+        result.message = (
+            f"Incoming credit linked as refund of #{refund_original.id} "
+            f"({refund_original.counterparty_norm})"
+        )
+        result.refund_link = refund_original.id

@@ -15,6 +15,7 @@ from app.schemas import (
     ConfirmMergeRequest,
     GroupExpenseRequest,
     IngestRequest,
+    ReconcileRequest,
     SettleRequest,
     SharedPromptRequest,
     TransactionOut,
@@ -241,3 +242,44 @@ def balances(session: Session = Depends(get_session)):
         entry["received"] += ge.received_so_far
         entry["net"] += net
     return by_person
+
+
+@app.post("/reconcile")
+def reconcile(
+    req: ReconcileRequest,
+    session: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+):
+    """Reconcile an account against a statement balance (Section 10.3)."""
+    _check_webhook_secret(authorization, x_webhook_secret)
+    from app.reconcile import reconcile_account
+
+    state = reconcile_account(session, req.account, req.statement_balance_paise, req.as_of)
+    session.commit()
+    return state
+
+
+@app.get("/confidence")
+def confidence(session: Session = Depends(get_session)):
+    """Confidence ladder summary: pending/confirmed/verified counts."""
+    from app.reconcile import confidence_report
+
+    return confidence_report(session)
+
+
+@app.get("/refunds")
+def list_refunds(session: Session = Depends(get_session)):
+    """All refund links."""
+    rows = session.execute(select(models.RefundLink)).scalars().all()
+    return [
+        {
+            "id": link.id,
+            "txn_id": link.txn_id,
+            "original_txn_id": link.original_txn_id,
+            "amount": link.amount,
+            "confidence": link.confidence,
+            "matched_at": link.matched_at,
+        }
+        for link in rows
+    ]
