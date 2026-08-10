@@ -54,6 +54,16 @@ def test_parse_amount_indian_grouping():
     assert amount == 500000
 
 
+def test_parse_amount_masks_utr():
+    # Regression: labeled UTR must never be read as the amount
+    amount, _ = parse_amount("UPI Ref 999900001111 of Rs.900.00 debited at swiggy")
+    assert amount == -90000
+    amount, _ = parse_amount(
+        "Rs.900.00 debited from A/c **1234 by UPI: swiggy. Ref: 999900001111"
+    )
+    assert amount == -90000
+
+
 def test_extract_utr_requires_label():
     # Prototype Bug E: bare 12-digit number is NOT a UTR
     assert extract_utr("order 412345678999 placed") is None

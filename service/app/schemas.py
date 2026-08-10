@@ -19,13 +19,15 @@ class SharedPromptRequest(BaseModel):
 class GroupExpenseRequest(BaseModel):
     transaction_id: int
     person: str
-    share_amount: int | None = None
+    share_amount_paise: int | None = None
+    """Your share in paise. Receivable = full_amount - share (Section 7.3)."""
 
 
 class SettleRequest(BaseModel):
     transaction_id: int
     group_expense_id: int
-    amount: int | None = None
+    amount_paise: int | None = None
+    """Amount to apply against the receivable, in paise. Defaults to txn amount."""
 
 
 class ConfirmMergeRequest(BaseModel):

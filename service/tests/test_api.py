@@ -65,7 +65,7 @@ def test_group_expense_and_balance(client):
 
     ge = client.post(
         "/webhook/group-expense",
-        json={"transaction_id": txn_id, "person": "sam", "share_amount": 300},
+        json={"transaction_id": txn_id, "person": "sam", "share_amount_paise": 30000},
         headers=_headers(),
     )
     assert ge.status_code == 200

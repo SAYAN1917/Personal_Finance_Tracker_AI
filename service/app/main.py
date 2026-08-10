@@ -163,9 +163,8 @@ def create_group_expense(
         raise HTTPException(status_code=404, detail="Transaction not found")
 
     full = abs(txn.amount_paise)
-    share = req.share_amount
-    if share is not None and share > 0:
-        share_paise = share * 100
+    share_paise = req.share_amount_paise
+    if share_paise is not None and share_paise > 0:
         receivable = max(0, full - share_paise)
     else:
         # Flag-only: receivable unknown until settlement (deferred math)
@@ -205,7 +204,7 @@ def settle(
     if not txn or not ge:
         raise HTTPException(status_code=404, detail="Transaction or group expense not found")
 
-    state = apply_settlement(session, txn, ge, req.amount)
+    state = apply_settlement(session, txn, ge, req.amount_paise)
     session.commit()
     return {"message": "Settled", "state": state}
 

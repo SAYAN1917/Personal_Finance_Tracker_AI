@@ -38,6 +38,9 @@ def parse_amount(text: str, direction_hint: str | None = None) -> tuple[int, str
     Bare amounts (no currency symbol) get their sign from surrounding words
     (Prototype Bug D): '450.00 debited' -> debit, '500 received' -> credit.
     """
+    # Mask labeled UTRs first: "Ref: 999900001111" must never become an amount
+    text = _mask_utrs(text)
+
     match = _AMOUNT_RE.search(text)
     if not match:
         return None
@@ -81,6 +84,14 @@ def extract_utr(text: str) -> str | None:
         if match:
             return match.group(1)
     return None
+
+
+def _mask_utrs(text: str) -> str:
+    """Replace labeled UTRs with spaces so they can't be parsed as amounts."""
+    masked = text
+    for pattern in _UTR_PATTERNS:
+        masked = pattern.sub(" ", masked)
+    return masked
 
 
 def normalize_counterparty(raw: str) -> str:
