@@ -62,7 +62,18 @@ def _check_webhook_secret(authorization: str | None, x_webhook_secret: str | Non
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Liveness for UptimeRobot (Section 13). DB check included so a dead DB
+    surfaces quickly instead of weeks later."""
+    try:
+        db.init_db()
+        from app.reconcile import confidence_report
+
+        with db.session_scope() as session:
+            report = confidence_report(session)
+        return {"status": "ok", "confidence": report["status_counts"], "db": "ok"}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Health check failed: %s", exc)
+        raise HTTPException(status_code=503, detail="db_down")
 
 
 @app.post("/webhook/ingest")

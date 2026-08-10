@@ -1,0 +1,15 @@
+[Unit]
+Description=Finance Tracker API
+After=network.target
+
+[Service]
+WorkingDirectory=/workspace/service
+Environment=DATABASE_URL=postgresql://finance:change-me@localhost:5432/finance
+Environment=WEBHOOK_SECRET=change-me
+Environment=ADMIN_USER_ID=
+ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

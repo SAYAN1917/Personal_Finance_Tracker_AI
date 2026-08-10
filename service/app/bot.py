@@ -194,6 +194,19 @@ class TelegramBot:
     def _ingest_text(self, chat_id: int, text: str, source: str = "telegram", channel: str = "telegram"):
         with db.session_scope() as session:
             result = ingest(session, source, text, channel)
+
+            # Graceful degradation: if rules can't parse, try the NLU lane
+            # (Section 6.3). AI failure = fall back to rules, never silent wrong.
+            if result.outcome == "FAILED":
+                from app.nlu import parse_with_llm
+
+                nlu = parse_with_llm(text)
+                if nlu and nlu.get("intent") == "group_expense" and nlu.get("amount_paise"):
+                    return self._ingest_nlu_group(chat_id, text, nlu)
+                if nlu and nlu.get("intent") == "expense" and nlu.get("amount_paise"):
+                    rebuilt = self._rebuild_for_rules(text, nlu)
+                    result = ingest(session, source, rebuilt, channel)
+
             txn = result.transaction
 
             if result.outcome == "FAILED":
@@ -355,6 +368,45 @@ class TelegramBot:
             )
             session.add(pa)
             session.commit()
+
+    def _rebuild_for_rules(self, text: str, nlu: dict) -> str:
+        """Translate NLU output into canonical text the deterministic parser
+        understands. The NLU never creates transactions directly.
+        """
+        amount = nlu.get("amount_paise", 0) / 100
+        direction = nlu.get("direction", "debit")
+        words = []
+        if direction == "credit":
+            words.append("credited")
+        if amount:
+            words.append(f"{amount:.2f}")
+        if nlu.get("counterparty"):
+            words.append(f"from {nlu['counterparty']}")
+        return " ".join(words) or text
+
+    def _ingest_nlu_group(self, chat_id: int, text: str, nlu: dict):
+        """group_expense intent from NLU: flag the spend shared + create the
+        receivable directly (full - share), or ask if share is unknown."""
+        with db.session_scope() as session:
+            result = ingest(session, "telegram", self._rebuild_for_rules(text, nlu), "telegram")
+            txn = result.transaction
+            if not txn:
+                self.send_message(chat_id, "Could not create that group expense - please try again.")
+                return
+            txn.txn_state = "flagged_shared"
+            person = nlu.get("person")
+            share = nlu.get("share_paise")
+            if person and share:
+                ge = create_group_expense(session, txn, person, share)
+                session.commit()
+                self.send_message(
+                    chat_id,
+                    f"Group expense #{ge.id}: {ge.person} owes Rs {ge.expected_receivable / 100:.0f} "
+                    f"(full {ge.full_amount / 100:.0f}, your share {ge.share_amount / 100:.0f}).",
+                )
+            else:
+                session.commit()
+                self._on_shared_answer(chat_id, txn.id, shared=True)
 
     # ---------- Reports ----------
 

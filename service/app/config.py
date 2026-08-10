@@ -28,9 +28,9 @@ class Settings:
         self.quiet_hours_start = int(os.getenv("QUIET_HOURS_START", "23"))
         self.quiet_hours_end = int(os.getenv("QUIET_HOURS_END", "7"))
 
-        self.llm_api_key = os.getenv("LLM_API_KEY", "")
-        self.llm_base_url = os.getenv("LLM_BASE_URL", "")
-        self.llm_model = os.getenv("LLM_MODEL", "")
+        self.llm_api_key = os.getenv("USER_LLM_API_KEY", "")
+        self.llm_base_url = os.getenv("USER_LLM_BASE_URL", "")
+        self.llm_model = os.getenv("USER_LLM_MODEL", "")
 
 
 settings = Settings()

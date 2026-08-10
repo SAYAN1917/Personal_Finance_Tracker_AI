@@ -1,0 +1,15 @@
+[Unit]
+Description=Finance Tracker Telegram Bot
+After=network.target finance-api.service
+
+[Service]
+WorkingDirectory=/workspace/service
+Environment=DATABASE_URL=postgresql://finance:change-me@localhost:5432/finance
+Environment=TELEGRAM_BOT_TOKEN=change-me
+Environment=ADMIN_USER_ID=
+ExecStart=/usr/bin/python3 -m app.bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
