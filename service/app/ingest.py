@@ -165,14 +165,8 @@ def _handle_inbound_credit(session, parsed, txn, channel, result: IngestResult):
     """Inbound credits are checked against open group expenses FIRST."""
     if parsed.txn_type != "credit":
         return
-    from app.config import settings
 
-    known_persons = _resolve_known_persons(session)
-    if known_persons and parsed.counterparty in known_persons:
-        # known person - check settlements even if amount is small
-        candidate = suggest_settlement(session, parsed.amount_paise, parsed.counterparty)
-    else:
-        candidate = suggest_settlement(session, parsed.amount_paise, parsed.counterparty)
+    candidate = suggest_settlement(session, parsed.amount_paise, parsed.counterparty)
 
     if candidate:
         result.settlement_candidate = candidate

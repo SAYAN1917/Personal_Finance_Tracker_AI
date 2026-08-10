@@ -56,6 +56,38 @@ def suggest_settlement(
     return None
 
 
+def create_group_expense(
+    session,
+    transaction,
+    person: str,
+    share_paise: int | None = None,
+) -> models.GroupExpense:
+    """Explicitly turn a shared expense into a receivable (Section 7.3).
+
+    Receivable = full amount - your share. Only the explicit path can create
+    a group expense; a shared flag alone is never a receivable.
+    """
+    full = abs(transaction.amount_paise)
+    share = share_paise if share_paise is not None else 0
+    share = min(share, full)
+    receivable = full - share
+
+    ge = models.GroupExpense(
+        transaction_id=transaction.id,
+        person=person.strip().lower(),
+        full_amount=full,
+        share_amount=share,
+        expected_receivable=receivable,
+        received_so_far=0,
+        status="open",
+    )
+    session.add(ge)
+    transaction.txn_state = "flagged_shared"
+    session.add(transaction)
+    session.flush()  # assign ge.id
+    return ge
+
+
 def apply_settlement(session, transaction, group_expense, amount_paise=None) -> dict:
     """Apply an inbound credit against a group expense. Returns updated state."""
     amount = amount_paise or abs(transaction.amount_paise)

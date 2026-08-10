@@ -162,14 +162,34 @@ def parse_telegram_entry(text: str, now: datetime | None = None) -> ParsedTxn:
     richer phrasing, but this must work standalone.
     """
     result = ParsedTxn()
-    amount_match = re.search(r"(\d+(?:\.\d{1,2})?)", text)
-    if amount_match:
-        result.amount_paise = round(float(amount_match.group(1)) * 100)
-    result.txn_type = "debit"
+
+    # Direction from words (Bug D): credited/received = credit, else debit
+    if re.search(r"\b(credited|received|came in|refund)\b", text, re.IGNORECASE):
+        result.txn_type = "credit"
+    else:
+        result.txn_type = "debit"
+
+    amount = parse_amount(text, direction_hint=None if result.txn_type == "credit" else "debit")
+    if amount:
+        result.amount_paise, result.currency = amount
+    else:
+        amount_match = re.search(r"(\d+(?:\.\d{1,2})?)", text)
+        if amount_match:
+            result.amount_paise = round(float(amount_match.group(1)) * 100)
+        result.currency = "INR"
+    if result.txn_type == "credit":
+        result.amount_paise = abs(result.amount_paise)
+    else:
+        result.amount_paise = -abs(result.amount_paise)
+
     result.mode = "UPI"
-    # First alphabetic token(s) = merchant/counterparty
-    rest = re.sub(r"[\d.,\s]+", " ", text).strip()
-    result.counterparty = normalize_counterparty(rest.split()[:2] and " ".join(rest.split()[:2]))
+    # Counterparty: 'from X' phrase wins; otherwise first words after amount
+    from_match = re.search(r"\bfrom\s+([a-zA-Z][a-zA-Z0-9_.]*)\b", text, re.IGNORECASE)
+    if from_match:
+        result.counterparty = normalize_counterparty(from_match.group(1))
+    else:
+        rest = re.sub(r"[\d.,\s]+", " ", text).strip()
+        result.counterparty = normalize_counterparty(" ".join(rest.split()[:2]))
     result.txn_date = _parse_date(text, now)
     result.confidence = 0.8 if result.amount_paise else 0.3
     return result

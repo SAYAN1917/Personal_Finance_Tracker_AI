@@ -36,6 +36,24 @@ def test_parse_amount_bare_no_direction_defaults_positive():
     assert amount == 45000
 
 
+def test_parse_amount_large_no_commas():
+    # Regression: "5000.00" was truncated to 500.00 by \d{1,3}
+    amount, _ = parse_amount("Rs.5000.00 credited", direction_hint=None)
+    assert amount == 500000
+    amount, _ = parse_amount("Rs.60000.00 credited", direction_hint=None)
+    assert amount == 6000000
+    amount, _ = parse_amount("Rs 123456.78 debited", direction_hint=None)
+    assert amount == -12345678
+
+
+def test_parse_amount_indian_grouping():
+    # Indian format 1,00,000 = one lakh
+    amount, _ = parse_amount("Rs.1,00,000.00 credited", direction_hint=None)
+    assert amount == 10000000
+    amount, _ = parse_amount("Rs.5,000.00 credited", direction_hint=None)
+    assert amount == 500000
+
+
 def test_extract_utr_requires_label():
     # Prototype Bug E: bare 12-digit number is NOT a UTR
     assert extract_utr("order 412345678999 placed") is None

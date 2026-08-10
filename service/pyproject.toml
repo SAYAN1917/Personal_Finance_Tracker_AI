@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Personal finance tracker - core API (parsing, dedup, settlements, ledger)"
 requires-python = ">=3.11"
 
+[project.scripts]
+finance-bot = "app.bot:run_bot_forever"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
