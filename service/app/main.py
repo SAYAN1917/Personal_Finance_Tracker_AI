@@ -2,6 +2,7 @@
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,7 @@ from app.schemas import (
     GroupExpenseRequest,
     IngestRequest,
     ReconcileRequest,
+    RecurringRequest,
     SettleRequest,
     SharedPromptRequest,
     TransactionOut,
@@ -283,3 +285,61 @@ def list_refunds(session: Session = Depends(get_session)):
         }
         for link in rows
     ]
+
+
+@app.get("/report/monthly")
+def monthly_report(
+    year: int | None = None,
+    month: int | None = None,
+    session: Session = Depends(get_session),
+):
+    """Monthly digest + category breakdown."""
+    from app.reports import monthly_digest
+
+    now = datetime.now()
+    return monthly_digest(
+        session,
+        year or now.year,
+        month or now.month,
+    )
+
+
+@app.get("/recurring/due")
+def recurring_due(session: Session = Depends(get_session)):
+    """Recurring bills due within the next 3 days."""
+    from app.reports import due_recurring
+
+    rows = due_recurring(session)
+    return [
+        {
+            "id": rec.id,
+            "merchant": rec.merchant,
+            "expected_amount": rec.expected_amount,
+            "category": rec.category,
+            "day_of_month": rec.day_of_month,
+            "last_seen_at": rec.last_seen_at,
+        }
+        for rec in rows
+    ]
+
+
+@app.post("/recurring")
+def create_recurring(
+    req: RecurringRequest,
+    session: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+):
+    """Register a known recurring bill for reminders."""
+    _check_webhook_secret(authorization, x_webhook_secret)
+    rec = models.Recurring(
+        pattern=req.pattern,
+        expected_amount=req.expected_amount_paise,
+        category=req.category,
+        merchant=req.merchant,
+        day_of_month=req.day_of_month,
+        active=True,
+    )
+    session.add(rec)
+    session.commit()
+    return {"id": rec.id, "merchant": rec.merchant}

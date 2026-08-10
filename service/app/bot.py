@@ -166,6 +166,8 @@ class TelegramBot:
                 "/find <query> - search transactions\n"
                 "/balances - who owes you\n"
                 "/status - this month's summary\n"
+                "/month - monthly digest\n"
+                "/bills - bills due in next 3 days\n"
                 "/test - try a sample transaction",
             )
         elif cmd == "/balances":
@@ -175,6 +177,10 @@ class TelegramBot:
         elif cmd == "/find":
             query = " ".join(parts[1:])
             self._send_search(chat_id, query)
+        elif cmd == "/month":
+            self._send_monthly(chat_id)
+        elif cmd == "/bills":
+            self._send_due_bills(chat_id)
         elif cmd == "/test":
             self._ingest_text(
                 chat_id,
@@ -381,6 +387,38 @@ class TelegramBot:
             for t in rows
         ]
         self.send_message(chat_id, "Latest transactions:\n" + "\n".join(lines))
+
+    def _send_monthly(self, chat_id: int):
+        from app.reports import monthly_digest
+
+        now = datetime.now()
+        with db.session_scope() as session:
+            digest = monthly_digest(session, now.year, now.month)
+        lines = [
+            f"Monthly digest {digest['month']}",
+            f"Spend: Rs {digest['spend_paise'] / 100:.0f}",
+            f"Income: Rs {digest['income_paise'] / 100:.0f}",
+            f"Net: Rs {digest['net_paise'] / 100:.0f}",
+        ]
+        if digest["top_category"]:
+            top = digest["top_category"]
+            lines.append(f"Top: {top['category']} (Rs {top['spend_paise'] / 100:.0f})")
+        self.send_message(chat_id, "\n".join(lines))
+
+    def _send_due_bills(self, chat_id: int):
+        from app.reports import due_recurring
+
+        with db.session_scope() as session:
+            rows = due_recurring(session)
+        if not rows:
+            self.send_message(chat_id, "No bills due in the next 3 days.")
+            return
+        lines = [
+            f"Due: {rec.merchant or '?'} Rs {rec.expected_amount / 100:.0f} "
+            f"(day {rec.day_of_month})"
+            for rec in rows
+        ]
+        self.send_message(chat_id, "\n".join(lines))
 
     def _send_search(self, chat_id: int, query: str):
         with db.session_scope() as session:

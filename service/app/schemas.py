@@ -37,6 +37,14 @@ class ReconcileRequest(BaseModel):
     as_of: datetime | None = None
 
 
+class RecurringRequest(BaseModel):
+    pattern: str = "monthly"
+    expected_amount_paise: int
+    category: str | None = None
+    merchant: str = ""
+    day_of_month: int | None = None
+
+
 class ConfirmMergeRequest(BaseModel):
     incoming_id: int
     canonical_id: int
