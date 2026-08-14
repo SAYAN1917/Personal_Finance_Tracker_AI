@@ -13,7 +13,6 @@ from app import db, models
 from app.config import settings
 from app.ingest import ingest
 from app.schemas import (
-    ConfirmMergeRequest,
     GroupExpenseRequest,
     IngestRequest,
     ReconcileRequest,
@@ -22,7 +21,7 @@ from app.schemas import (
     SharedPromptRequest,
     TransactionOut,
 )
-from app.settlements import apply_settlement, suggest_settlement
+from app.settlements import apply_settlement
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -155,9 +154,11 @@ def shared_prompt(
 
     if req.shared:
         txn.txn_state = "flagged_shared"
+        txn.needs_review = False
         message = "Flagged shared - full amount stays in spend. Create group expense to make it a receivable."
     else:
         txn.txn_state = "personal"
+        txn.needs_review = False
         message = "Marked personal."
     session.commit()
     return {"message": message, "transaction_id": txn.id, "txn_state": txn.txn_state}
@@ -176,32 +177,17 @@ def create_group_expense(
     if not txn:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
-    full = abs(txn.amount_paise)
-    share_paise = req.share_amount_paise
-    if share_paise is not None and share_paise > 0:
-        receivable = max(0, full - share_paise)
-    else:
-        # Flag-only: receivable unknown until settlement (deferred math)
-        receivable = 0
-        share_paise = None
+    from app.settlements import create_group_expense as make_group_expense
 
-    ge = models.GroupExpense(
-        transaction_id=txn.id,
-        person=req.person,
-        full_amount=full,
-        share_amount=share_paise,
-        expected_receivable=receivable,
-        received_so_far=0,
-        status="open",
-    )
-    session.add(ge)
-    txn.txn_state = "flagged_shared"
+    ge = make_group_expense(session, txn, req.person, req.share_amount_paise)
     session.commit()
     return {
         "group_expense_id": ge.id,
         "person": ge.person,
-        "expected_receivable": receivable,
-        "note": "Share unknown - will be computed at settlement" if receivable == 0 else "Receivable tracked",
+        "expected_receivable": ge.expected_receivable,
+        "note": "Share unknown - will be computed at settlement"
+        if ge.share_amount is None
+        else "Receivable tracked",
     }
 
 

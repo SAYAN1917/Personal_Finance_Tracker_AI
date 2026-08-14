@@ -1,6 +1,5 @@
 """Tests for normalizer - amount direction, UTR validation, fingerprinting."""
 
-import hashlib
 from datetime import datetime
 
 from app.normalizer import (
@@ -30,10 +29,20 @@ def test_parse_amount_bare_with_credit_word():
     assert amount == 60000
 
 
-def test_parse_amount_bare_no_direction_defaults_positive():
-    # Ambiguous bare amount: default positive, caller flags needs_review
+def test_parse_amount_bare_no_direction_defaults_debit():
+    # Prototype Bug D: an ambiguous bare amount must NEVER default to positive
+    # (that would silently turn a spend into income). Default = debit.
     amount, _ = parse_amount("450.00 towards purchase", direction_hint=None)
-    assert amount == 45000
+    assert amount == -45000
+
+
+def test_detect_direction_words():
+    from app.normalizer import detect_direction
+
+    assert detect_direction("450.00 debited") == "debit"
+    assert detect_direction("500 received") == "credit"
+    assert detect_direction("450.00 towards purchase") is None
+    assert detect_direction("400 debited and 500 credited") is None
 
 
 def test_parse_amount_large_no_commas():

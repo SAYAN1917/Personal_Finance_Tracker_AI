@@ -130,29 +130,43 @@ class TelegramBot:
             if not pa:
                 return False
             if pa.step == "mkgroup_person":
-                self._finish_mkgroup(session, chat_id, pa, text)
-                session.delete(pa)
-                session.commit()
+                done = self._finish_mkgroup(session, chat_id, pa, text)
+                if done:
+                    session.delete(pa)
+                    session.commit()
                 return True
             return False
 
-    def _finish_mkgroup(self, session, chat_id: int, pa: models.PendingAction, text: str):
+    def _finish_mkgroup(self, session, chat_id: int, pa: models.PendingAction, text: str) -> bool:
         ctx = json.loads(pa.context_json or "{}")
         txn_id = ctx.get("txn_id")
         txn = session.get(models.Transaction, txn_id)
         if not txn:
-            return
-        m = re.match(r"(?:group\s+)?(\w+)\s+(\d+(?:\.\d{1,2})?)", text)
+            self.send_message(chat_id, "Transaction not found - please start again.")
+            return False
+        # Share is optional: 'group sam' defers the share to settlement;
+        # 'group sam 300' computes receivable = full - share now.
+        m = re.match(r"(?:group\s+)?([a-zA-Z][a-zA-Z0-9_.]*)\s*(\d+(?:\.\d{1,2})?)?", text)
         if not m:
-            return
+            self.send_message(
+                chat_id,
+                "Reply with: group <person> [your share]\n"
+                "e.g. 'group sam 300' or 'group sam' (share computed at settlement).",
+            )
+            return False
         person, share_str = m.group(1), m.group(2)
-        share_paise = round(float(share_str) * 100)
+        share_paise = round(float(share_str) * 100) if share_str else None
         ge = create_group_expense(session, txn, person, share_paise)
+        if ge.share_amount is None:
+            note = "share unknown - receivable computed at settlement"
+        else:
+            note = f"your share {ge.share_amount / 100:.0f}"
         self.send_message(
             chat_id,
             f"Group expense #{ge.id}: {ge.person} owes Rs {ge.expected_receivable / 100:.0f} "
-            f"(full {ge.full_amount / 100:.0f}, your share {ge.share_amount / 100:.0f}).",
+            f"(full {ge.full_amount / 100:.0f}, {note}).",
         )
+        return True
 
     def _handle_command(self, chat_id: int, text: str):
         parts = text.split()
@@ -218,7 +232,11 @@ class TelegramBot:
                 return
 
             if result.outcome == "WEAK":
-                self.send_message(chat_id, "Possible duplicate - I'll mark it needs_review. /find to check.")
+                self.send_message(
+                    chat_id,
+                    "Possible duplicate - stored with needs_review (not merged). "
+                    "Use /find or /status to inspect it.",
+                )
                 return
 
             # NEW transaction
@@ -318,6 +336,7 @@ class TelegramBot:
                 return
             if shared:
                 txn.txn_state = "flagged_shared"
+                txn.needs_review = False
                 markup = {
                     "inline_keyboard": [[
                         {"text": "Create group expense", "callback_data": f"mkgroup:{txn_id}"},
@@ -332,6 +351,7 @@ class TelegramBot:
                 )
             else:
                 txn.txn_state = "personal"
+                txn.needs_review = False
                 self.send_message(chat_id, "Marked personal.")
             session.commit()
 

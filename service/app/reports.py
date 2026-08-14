@@ -8,7 +8,8 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import calendar
+from datetime import date, datetime
 
 from sqlalchemy import func, select
 
@@ -129,7 +130,10 @@ def due_recurring(
         # Skip if we already saw it this cycle (seen this month)
         if last is not None and last.month == today.month and last.year == today.year:
             continue
-        due = date(today.year, today.month, rec.day_of_month)
+        # Clamp to the last day of the month so day=31 never crashes in a
+        # 30-day month (e.g. checking in April).
+        last_day = calendar.monthrange(today.year, today.month)[1]
+        due = date(today.year, today.month, min(rec.day_of_month, last_day))
         if due < today:
             # already passed this month - not an upcoming reminder
             continue

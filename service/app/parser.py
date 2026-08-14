@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from app.normalizer import (
+    detect_direction,
     extract_utr,
     merchant_from_text,
     normalize_counterparty,
@@ -73,7 +74,9 @@ def _parse_date(text: str, now: datetime | None = None) -> datetime | None:
 def _detect_mode(text: str) -> str:
     if re.search(r"\bupi\b", text, re.IGNORECASE):
         return "UPI"
-    if re.search(r"\b(neft|imps)\b", text, re.IGNORECASE):
+    if re.search(r"\bimps\b", text, re.IGNORECASE):
+        return "IMPS"
+    if re.search(r"\bneft\b", text, re.IGNORECASE):
         return "NEFT"
     if re.search(r"\bcard\b|\bpos\b|purchase at", text, re.IGNORECASE):
         return "CARD"
@@ -102,6 +105,11 @@ def parse_upi_sms(text: str, now: datetime | None = None) -> ParsedTxn:
     result.amount_paise, result.currency = amount
     result.txn_type = "debit" if result.amount_paise < 0 else "credit"
 
+    # Prototype Bug D: if no direction word gives the sign, flag for review
+    # instead of silently trusting a debit/credit guess.
+    if detect_direction(text) is None:
+        result.flags.append("ambiguous_direction")
+
     result.txn_date = _parse_date(text, now)
     result.mode = _detect_mode(text)
     result.account = _detect_account(text)
@@ -122,12 +130,72 @@ def parse_card_pdf(text: str, now: datetime | None = None) -> ParsedTxn:
         return result
     result.amount_paise, result.currency = amount
     result.txn_type = "debit" if result.amount_paise < 0 else "credit"
+    if detect_direction(text) is None:
+        result.flags.append("ambiguous_direction")
     result.mode = "CARD"
     result.counterparty = merchant_from_text(text) or normalize_counterparty(
         re.sub(r"^\d+\s*", "", text)[:40]
     )
     result.confidence = 0.6
     return result
+
+
+def _extract_amount_paise(text: str) -> tuple[int, bool]:
+    """Return (amount_paise, was_negative) for a GPay-style row.
+
+    Prefers a currency-marked or decimal (cents) number and skips date
+    components like 12-08-2026 so the date is never read as the amount.
+    Uses Decimal - never float - for money.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    decimal_re = re.compile(r"(?<![0-9a-z])-?\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?(?![0-9a-z])", re.IGNORECASE)
+    currency_re = re.compile(r"(?:rs\.?|inr|₹)\s*(-?\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?)", re.IGNORECASE)
+
+    def to_paise(token: str) -> int | None:
+        negative = token.strip().startswith("-")
+        digits = token.strip().lstrip("-").replace(",", "")
+        try:
+            value = Decimal(digits)
+        except InvalidOperation:
+            return None
+        paise = int(value * 100)
+        return -paise if negative else paise
+
+    # 1. Explicit currency marker wins (₹450.00 / Rs. 450.00 / INR 450)
+    cur = currency_re.search(text)
+    if cur:
+        paise = to_paise(cur.group(1))
+        if paise is not None:
+            return paise, paise < 0
+
+    # 2. Collect candidate numbers, skipping date components (surrounded by -/)
+    candidates: list[tuple[int, int, bool]] = []
+    for m in decimal_re.finditer(text):
+        start, end = m.start(), m.end()
+        prev = text[start - 1] if start > 0 else ""
+        nxt = text[end] if end < len(text) else ""
+        if prev in "-/" or nxt in "-/":
+            continue  # part of a date like 12-08-2026
+        token = m.group(0)
+        paise = to_paise(token)
+        if paise is None:
+            continue
+        has_cents = "." in token
+        # negative sign already reflected in paise
+        candidates.append((paise, start, has_cents))
+
+    if not candidates:
+        return 0, False
+
+    # Prefer a cents-bearing amount (450.00) over a bare integer; otherwise
+    # the rightmost standalone number (amount usually appears last).
+    with_cents = [c for c in candidates if c[2]]
+    if with_cents:
+        chosen = max(with_cents, key=lambda c: c[1])
+    else:
+        chosen = max(candidates, key=lambda c: c[1])
+    return chosen[0], chosen[0] < 0
 
 
 def parse_gpay_csv(line: str, now: datetime | None = None) -> ParsedTxn:
@@ -139,16 +207,21 @@ def parse_gpay_csv(line: str, now: datetime | None = None) -> ParsedTxn:
     result.utr = extract_utr(joined) or None
     result.txn_date = _parse_date(joined, now)
 
-    amount_match = re.search(r"(?:Debit|Credit)?\s*(?:Rs\.?\s*)?(\d+\.?\d*)", joined, re.IGNORECASE)
-    if amount_match:
-        result.amount_paise = round(float(amount_match.group(1)) * 100)
+    result.amount_paise, was_negative = _extract_amount_paise(joined)
 
-    if re.search(r"\bdebit\b", joined, re.IGNORECASE):
-        result.txn_type = "debit"
-        result.amount_paise = -abs(result.amount_paise)
-    elif re.search(r"\bcredit\b", joined, re.IGNORECASE):
+    if re.search(r"\bcredit\b", joined, re.IGNORECASE):
         result.txn_type = "credit"
         result.amount_paise = abs(result.amount_paise)
+    elif re.search(r"\bdebit\b", joined, re.IGNORECASE):
+        result.txn_type = "debit"
+        result.amount_paise = -abs(result.amount_paise)
+    elif was_negative:
+        result.txn_type = "debit"
+        result.amount_paise = -abs(result.amount_paise)
+    else:
+        result.txn_type = "debit"
+        if detect_direction(joined) is None:
+            result.flags.append("ambiguous_direction")
     result.mode = "UPI"
     result.counterparty = merchant_from_text(joined)
     result.confidence = 0.6 if result.amount_paise else 0.2

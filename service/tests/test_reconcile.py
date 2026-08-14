@@ -7,7 +7,6 @@ import pytest
 from app import db, models
 from app.config import settings
 from app.ingest import ingest
-from app.refunds import link_refund, suggest_refund
 
 
 @pytest.fixture

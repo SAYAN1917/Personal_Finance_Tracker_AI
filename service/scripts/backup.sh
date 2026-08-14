@@ -2,7 +2,9 @@
 # Nightly backup: dump the DB, compress, send to your Telegram Saved Messages.
 # Usage: TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy ./scripts/backup.sh
 # Schedule with cron: 0 3 * * * /workspace/service/scripts/backup.sh
-# Restore: gunzip -c backup.sql.gz | sqlite3 finance.db
+# Restore (sqlite3 .backup produces a binary file, NOT a SQL dump):
+#   gunzip -c backup.sql.gz > /tmp/finance.backup
+#   sqlite3 finance.db ".restore '/tmp/finance.backup'"
 
 set -euo pipefail
 

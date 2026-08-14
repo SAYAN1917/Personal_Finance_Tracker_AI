@@ -36,7 +36,9 @@ def find_settlement_candidates(
     candidates = []
     for ge in rows:
         ge_person = ge.person.strip().lower()
-        if person and person in ge_person or ge_person in person:
+        # Precedence: person must be non-empty before any containment test.
+        # `ge_person in person` on an empty `person` would falsely match "".
+        if person and (person in ge_person or ge_person in person):
             candidates.append((ge, 2.0))
         elif ge.expected_receivable == amount:
             candidates.append((ge, 1.0))
@@ -66,11 +68,20 @@ def create_group_expense(
 
     Receivable = full amount - your share. Only the explicit path can create
     a group expense; a shared flag alone is never a receivable.
+
+    share_paise is the user's OWN share. None or 0 means the share is not
+    known yet (flag-only) - the receivable is deferred until settlement
+    (Section 7.3 deferred math). It must NOT be interpreted as 'friend owes
+    the full amount'.
     """
     full = abs(transaction.amount_paise)
-    share = share_paise if share_paise is not None else 0
-    share = min(share, full)
-    receivable = full - share
+    if share_paise is not None and share_paise > 0:
+        share = min(share_paise, full)
+        receivable = max(0, full - share)
+    else:
+        # Flag-only: share unknown -> deferred, computed at settlement
+        share = None
+        receivable = 0
 
     ge = models.GroupExpense(
         transaction_id=transaction.id,

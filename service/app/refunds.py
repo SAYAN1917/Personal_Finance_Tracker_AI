@@ -9,7 +9,7 @@ Conservative: only auto-link when EXACTLY ONE candidate matches. Ambiguous
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from sqlalchemy import select
 

@@ -81,3 +81,17 @@ def test_due_recurring_seen_this_month_skipped(setup):
         s.commit()
         rows = due_recurring(s, today=date(2026, 8, 10), horizon_days=3)
         assert rows == []
+
+
+def test_due_recurring_clamps_invalid_day(setup):
+    """Bug: day_of_month=31 crashed on a 30-day month. Clamp to month end."""
+    from app.reports import due_recurring
+
+    with db.session_scope() as s:
+        s.add(models.Recurring(
+            pattern="monthly", expected_amount=200000,
+            merchant="netflix", day_of_month=31,
+        ))
+        s.commit()
+        rows = due_recurring(s, today=date(2026, 4, 29), horizon_days=3)
+        assert [r.merchant for r in rows] == ["netflix"]

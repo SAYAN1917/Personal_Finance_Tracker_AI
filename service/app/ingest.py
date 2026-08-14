@@ -13,8 +13,8 @@ from datetime import datetime
 from sqlalchemy import select
 
 from app import models
-from app.classify import classify_category, is_shared_heuristic
-from app.dedup import CHANNEL_PRIORITY, DedupEngine
+from app.classify import classify_category
+from app.dedup import DedupEngine
 from app.parser import PARSERS, ParsedTxn
 from app.settlements import suggest_settlement
 
@@ -61,6 +61,52 @@ def _resolve_known_persons(session) -> list[str]:
     return names
 
 
+def _build_transaction(parsed: ParsedTxn, source: str, needs_review: bool = False) -> models.Transaction:
+    """Construct a ledger row from a parse. Keys computed here so both the NEW
+    and WEAK (review) paths share identical logic."""
+    txn = models.Transaction(
+        txn_date=parsed.txn_date or datetime.now(),
+        value_date=parsed.txn_date,
+        amount_paise=parsed.amount_paise,
+        currency=parsed.currency,
+        type=parsed.txn_type,
+        mode=parsed.mode,
+        counterparty_norm=parsed.counterparty,
+        account=parsed.account,
+        utr=parsed.utr,
+        sources=json.dumps([source]),
+        parser_version=parsed.parser_version,
+        status="pending",
+        lifecycle="active",
+        txn_state="personal",
+        ownership="mine",
+        needs_review=needs_review or bool(parsed.flags),
+    )
+
+    if parsed.utr:
+        from app.normalizer import exact_key
+
+        txn.key_exact = exact_key(
+            parsed.amount_paise,
+            parsed.txn_date,
+            parsed.counterparty,
+            parsed.mode,
+            parsed.account,
+            parsed.utr,
+        )
+    else:
+        from app.normalizer import fingerprint_key
+
+        txn.key_soft = fingerprint_key(
+            parsed.amount_paise,
+            parsed.txn_date,
+            parsed.counterparty,
+            parsed.mode,
+            parsed.account,
+        )
+    return txn
+
+
 def ingest(session, source: str, text: str, channel: str = "") -> IngestResult:
     log_event(session, source, text, channel)
 
@@ -90,54 +136,22 @@ def ingest(session, source: str, text: str, channel: str = "") -> IngestResult:
         return result
 
     if match.outcome == "WEAK":
-        return IngestResult(
+        # Never silently merge and never silently drop: store with
+        # needs_review so the human can decide [Merge]/[No] (Section 5.4).
+        txn = _build_transaction(parsed, channel or source, needs_review=True)
+        session.add(txn)
+        session.flush()
+        result = IngestResult(
             "WEAK",
-            message="Possible duplicate - needs review",
+            transaction=txn,
+            message="Possible duplicate - stored for review, not auto-merged",
             needs_review=True,
         )
+        _handle_inbound_credit(session, parsed, txn, channel, result)
+        return result
 
     # NEW transaction
-    txn = models.Transaction(
-        txn_date=parsed.txn_date or datetime.now(),
-        value_date=parsed.txn_date,
-        amount_paise=parsed.amount_paise,
-        currency=parsed.currency,
-        type=parsed.txn_type,
-        mode=parsed.mode,
-        counterparty_norm=parsed.counterparty,
-        account=parsed.account,
-        utr=parsed.utr,
-        sources=json.dumps([channel or source]),
-        parser_version=parsed.parser_version,
-        status="pending",
-        lifecycle="active",
-        txn_state="personal",
-        ownership="mine",
-        needs_review=False,
-    )
-
-    if parsed.utr:
-        from app.normalizer import exact_key
-
-        txn.key_exact = exact_key(
-            parsed.amount_paise,
-            parsed.txn_date,
-            parsed.counterparty,
-            parsed.mode,
-            parsed.account,
-            parsed.utr,
-        )
-    else:
-        from app.normalizer import fingerprint_key
-
-        txn.key_soft = fingerprint_key(
-            parsed.amount_paise,
-            parsed.txn_date,
-            parsed.counterparty,
-            parsed.mode,
-            parsed.account,
-        )
-
+    txn = _build_transaction(parsed, channel or source)
     session.add(txn)
     session.flush()  # assign id
 

@@ -90,7 +90,7 @@ def test_ambiguous_settlement_left_unmatched(session):
     ge.expected_receivable = 60000
     session.commit()
 
-    inc = ingest(
+    ingest(
         session,
         "sms",
         "Rs.600.00 credited to A/c **1234 on 05-08-26 by UPI: sam@ybl. Ref: 412345678998",
@@ -123,3 +123,29 @@ def test_partial_settlement(session):
     session.commit()
     assert state["status"] == "partial"
     assert state["outstanding_after"] == 30000
+
+
+def test_group_expense_share_unknown_is_deferred(session):
+    """Bug: share=None was treated as 'friend owes the full amount'. Flag-only
+    means deferred math (Section 7.3): receivable stays 0 until settlement."""
+    from app.settlements import create_group_expense
+
+    r = ingest(session, "telegram", "dinner 900")
+    session.commit()
+    ge = create_group_expense(session, r.transaction, "sam", None)
+    session.commit()
+    assert ge.share_amount is None
+    assert ge.expected_receivable == 0
+    assert ge.status == "open"
+
+
+def test_settlement_empty_fields_no_false_person_match(session):
+    """Bug: operator precedence let an empty counterparty falsely match an
+    empty-person group expense."""
+    from app.settlements import find_settlement_candidates
+
+    r = ingest(session, "telegram", "dinner 900")
+    session.commit()
+    _create_group(session, r.transaction, "", share_paise=30000)
+    candidates = find_settlement_candidates(session, 99900, "")
+    assert candidates == []

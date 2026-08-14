@@ -70,7 +70,6 @@ def test_mkgroup_creates_receivable(fake_bot):
 
 
 def test_mkgroup_then_settle(fake_bot):
-    bot = fake_bot
     with db.session_scope() as s:
         res = ingest(s, "telegram", "dinner 900")
         txn = res.transaction
@@ -97,7 +96,7 @@ def test_settlement_confirmed_marks_reimbursement(fake_bot):
         res = ingest(s, "telegram", "dinner 900")
         txn = res.transaction
         ge = create_group_expense(s, txn, "sam", 30000)
-        txn_id, ge_id = txn.id, ge.id
+        ge_id = ge.id
         txn.status = "confirmed"
         s.add(txn)
     with db.session_scope() as s:
@@ -114,7 +113,6 @@ def test_settlement_confirmed_marks_reimbursement(fake_bot):
 
 
 def test_quiet_hours_suppress_prompt(fake_bot, monkeypatch):
-    from datetime import datetime
 
     bot = fake_bot
     monkeypatch.setattr(
@@ -130,6 +128,39 @@ def test_quiet_hours_suppress_prompt(fake_bot, monkeypatch):
     last = bot.sent[-1]
     assert "recorded" in last["text"].lower()
     assert "shared expense?" not in last["text"].lower()
+
+
+def test_mkgroup_share_optional(fake_bot):
+    """Bug: 'group sam' (no share) failed silently and dropped the pending
+    action. Share must be optional -> deferred receivable."""
+    bot = fake_bot
+    with db.session_scope() as s:
+        res = ingest(s, "telegram", "dinner 900")
+        txn_id = res.transaction.id
+    bot._on_shared_answer(123, txn_id, shared=True)
+    bot._on_mkgroup(123, txn_id)
+    bot._handle_pending_continuation(123, "group sam")
+    assert "sam" in _last_text(bot)
+    with db.session_scope() as s:
+        ge = s.query(models.GroupExpense).first()
+        assert ge is not None
+        assert ge.person == "sam"
+        assert ge.share_amount is None
+        assert ge.expected_receivable == 0
+
+
+def test_mkgroup_bad_input_keeps_pending(fake_bot):
+    bot = fake_bot
+    with db.session_scope() as s:
+        res = ingest(s, "telegram", "dinner 900")
+        txn_id = res.transaction.id
+    bot._on_shared_answer(123, txn_id, shared=True)
+    bot._on_mkgroup(123, txn_id)
+    bot._handle_pending_continuation(123, "9999")
+    # pending action survives so the user can retry
+    with db.session_scope() as s:
+        assert s.query(models.PendingAction).count() == 1
+        assert s.query(models.GroupExpense).count() == 0
 
 
 def test_credit_from_person_parses_for_settlement(fake_bot):

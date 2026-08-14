@@ -37,6 +37,8 @@ def parse_amount(text: str, direction_hint: str | None = None) -> tuple[int, str
     direction_hint is an explicit 'debit'/'credit' supplied by the caller.
     Bare amounts (no currency symbol) get their sign from surrounding words
     (Prototype Bug D): '450.00 debited' -> debit, '500 received' -> credit.
+    A truly ambiguous bare amount defaults to DEBIT - never to positive
+    (an unknown sign must not be recorded as income).
     """
     # Mask labeled UTRs first: "Ref: 999900001111" must never become an amount
     text = _mask_utrs(text)
@@ -66,15 +68,31 @@ def parse_amount(text: str, direction_hint: str | None = None) -> tuple[int, str
     if direction_hint == "debit":
         return -paise, currency
 
-    # No explicit hint - look for direction words in the text
-    if _CREDIT_WORDS.search(text):
+    direction = detect_direction(text)
+    if direction == "credit":
         return paise, currency
-    if _DEBIT_WORDS.search(text):
+    if direction == "debit":
         return -paise, currency
 
-    # Ambiguous bare amount with no direction word anywhere: default debit is
-    # dangerous; return positive and let the caller flag needs_review.
-    return paise, currency
+    # Ambiguous bare amount with no direction word anywhere (Prototype Bug D):
+    # default to debit, never to positive. The parser flags this for
+    # needs_review so a missed 'credited' can never inflate income.
+    return -paise, currency
+
+
+def detect_direction(text: str) -> str | None:
+    """Return 'debit' / 'credit' from direction words, or None if ambiguous.
+
+    Both direction words present (or neither) means we cannot be sure the
+    number belongs to a debit or credit - callers should flag needs_review.
+    """
+    has_credit = bool(_CREDIT_WORDS.search(text))
+    has_debit = bool(_DEBIT_WORDS.search(text))
+    if has_credit and not has_debit:
+        return "credit"
+    if has_debit and not has_credit:
+        return "debit"
+    return None
 
 
 def extract_utr(text: str) -> str | None:

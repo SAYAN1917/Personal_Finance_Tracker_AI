@@ -18,10 +18,10 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 
 from app import models
-from app.normalizer import exact_key, fingerprint_key
+from app.normalizer import exact_key
 
 CHANNEL_PRIORITY = {"sms": 5, "email": 4, "telegram": 3, "upi_csv": 2, "card_pdf": 1}
 
