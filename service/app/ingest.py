@@ -13,7 +13,7 @@ from datetime import datetime
 from sqlalchemy import select
 
 from app import models
-from app.classify import classify_category
+from app.classify import classify_category, is_transfer
 from app.dedup import DedupEngine
 from app.parser import PARSERS, ParsedTxn
 from app.settlements import suggest_settlement
@@ -30,6 +30,7 @@ class IngestResult:
         needs_review: bool = False,
         settlement_candidate: models.GroupExpense | None = None,
         refund_link: int | None = None,
+        duplicate_of: models.Transaction | None = None,
     ):
         self.outcome = outcome  # NEW / EXACT / STRONG / WEAK / FAILED
         self.transaction = transaction
@@ -37,6 +38,7 @@ class IngestResult:
         self.needs_review = needs_review
         self.settlement_candidate = settlement_candidate
         self.refund_link = refund_link
+        self.duplicate_of = duplicate_of  # single canonical candidate for WEAK
 
 
 def log_event(session, source: str, text: str, channel: str = "") -> models.Event:
@@ -146,6 +148,7 @@ def ingest(session, source: str, text: str, channel: str = "") -> IngestResult:
             transaction=txn,
             message="Possible duplicate - stored for review, not auto-merged",
             needs_review=True,
+            duplicate_of=match.canonical,
         )
         _handle_inbound_credit(session, parsed, txn, channel, result)
         return result
@@ -172,9 +175,26 @@ def _classify_new(session, parsed: ParsedTxn, txn: models.Transaction, result: I
         result.message = "Incoming credit (income/reimbursement?)"
         return
 
+    if is_transfer(parsed.counterparty):
+        txn.category = "transfer"
+        txn.txn_state = "personal"
+        result.message = f"Transfer (not spend): Rs {abs(txn.amount_paise) / 100:.0f}"
+        return
+
     category = classify_category(parsed.counterparty, known_persons)
     txn.category = category
+    _link_recurring(session, txn)
     result.message = f"New expense: Rs {abs(txn.amount_paise) / 100:.0f}"
+
+
+def _link_recurring(session, txn: models.Transaction):
+    """Auto-link a NEW debit to its recurring bill and mark it seen, when
+    exactly one bill matches conservatively (Section 11.3)."""
+    from app.reports import mark_recurring_seen, match_recurring
+
+    rec = match_recurring(session, txn)
+    if rec:
+        mark_recurring_seen(session, rec, txn)
 
 
 def _handle_inbound_credit(session, parsed, txn, channel, result: IngestResult):

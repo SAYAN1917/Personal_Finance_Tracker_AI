@@ -10,9 +10,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app import db, models
+from app.audit import audit
 from app.config import settings
 from app.ingest import ingest
 from app.schemas import (
+    ConfirmMergeRequest,
     GroupExpenseRequest,
     IngestRequest,
     ReconcileRequest,
@@ -153,15 +155,48 @@ def shared_prompt(
         raise HTTPException(status_code=404, detail="Transaction not found")
 
     if req.shared:
+        before = txn.txn_state
         txn.txn_state = "flagged_shared"
         txn.needs_review = False
+        audit(session, "api", "shared_prompt", "transaction", txn.id, before=before, after="flagged_shared")
         message = "Flagged shared - full amount stays in spend. Create group expense to make it a receivable."
     else:
+        before = txn.txn_state
         txn.txn_state = "personal"
         txn.needs_review = False
+        audit(session, "api", "shared_prompt", "transaction", txn.id, before=before, after="personal")
         message = "Marked personal."
     session.commit()
     return {"message": message, "transaction_id": txn.id, "txn_state": txn.txn_state}
+
+
+@app.post("/webhook/confirm-merge")
+def confirm_merge(
+    req: ConfirmMergeRequest,
+    session: Session = Depends(get_session),
+    authorization: str | None = Header(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+):
+    """Human resolution for a WEAK dedup txn: [Merge] folds it into the
+    canonical row, [No] keeps it as a distinct transaction."""
+    _check_webhook_secret(authorization, x_webhook_secret)
+    incoming = session.get(models.Transaction, req.incoming_id)
+    canonical = session.get(models.Transaction, req.canonical_id)
+    if not incoming or not canonical:
+        raise HTTPException(status_code=404, detail="Incoming or canonical transaction not found")
+
+    from app.dedup import merge_transaction
+
+    if req.confirm:
+        merge_transaction(session, incoming, canonical)
+        audit(session, "api", "merge", "transaction", incoming.id, before="review", after=f"merged into #{canonical.id}")
+        session.commit()
+        return {"message": "Merged into canonical", "canonical_id": canonical.id}
+    incoming.needs_review = False
+    incoming.status = "pending"
+    audit(session, "api", "merge_no", "transaction", incoming.id, before="needs_review", after="kept distinct")
+    session.commit()
+    return {"message": "Kept as a distinct transaction", "incoming_id": incoming.id}
 
 
 @app.post("/webhook/group-expense")
@@ -180,6 +215,16 @@ def create_group_expense(
     from app.settlements import create_group_expense as make_group_expense
 
     ge = make_group_expense(session, txn, req.person, req.share_amount_paise)
+    audit(
+        session,
+        "api",
+        "group_expense",
+        "group_expense",
+        ge.id,
+        before=f"txn #{txn.id} flagged_shared",
+        after=f"receivable {ge.expected_receivable}",
+        reason=f"person={ge.person}",
+    )
     session.commit()
     return {
         "group_expense_id": ge.id,
@@ -205,6 +250,16 @@ def settle(
         raise HTTPException(status_code=404, detail="Transaction or group expense not found")
 
     state = apply_settlement(session, txn, ge, req.amount_paise)
+    audit(
+        session,
+        "api",
+        "settle",
+        "settlement",
+        txn.id,
+        before=f"txn #{txn.id} pending",
+        after=f"applied {state['applied']}",
+        reason=f"ge #{ge.id}",
+    )
     session.commit()
     return {"message": "Settled", "state": state}
 
@@ -338,5 +393,13 @@ def create_recurring(
         active=True,
     )
     session.add(rec)
+    audit(
+        session,
+        "api",
+        "recurring",
+        "recurring",
+        rec.id,
+        after=f"amount {rec.expected_amount} merchant={rec.merchant}",
+    )
     session.commit()
     return {"id": rec.id, "merchant": rec.merchant}

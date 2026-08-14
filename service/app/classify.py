@@ -74,6 +74,15 @@ CATEGORY_KEYWORDS = [
     (r"\b(salary|interest|dividend)\b", "income"),
 ]
 
+# Transfers (Section 6 edge cases 19/20/24): moving money between your own
+# accounts/pockets is NOT spend. Whole-word anchored; conservative.
+TRANSFER_PATTERNS = [
+    r"\b(wallet top\s?-?up|add money to wallet|wallet recharge)\b",
+    r"\b(paytm wallet|phonepe wallet|amazon pay balance)\b",
+    r"\b(credit card (bill|repayment|payment)|card bill|credit card bill payment)\b",
+    r"\b(transfer to self|self transfer|own account|own a/c|between accounts|my other account)\b",
+]
+
 
 def is_known_person(counterparty: str, persons: list[str]) -> bool:
     if not counterparty:
@@ -103,6 +112,16 @@ def classify_category(counterparty: str, known_persons: list[str] | None = None)
             return category
 
     return None
+
+
+def is_transfer(counterparty: str) -> bool:
+    """True if the debit moves money between own accounts/pockets (wallet
+    top-up, card-bill repayment, self-transfer). Such debits are tagged
+    category 'transfer' and excluded from spend (Section 6 edge cases 19/20)."""
+    if not counterparty:
+        return False
+    c = counterparty.strip().lower()
+    return any(re.search(pattern, c) for pattern in TRANSFER_PATTERNS)
 
 
 def is_shared_heuristic(

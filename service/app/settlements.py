@@ -10,6 +10,8 @@ Conservative by design:
 
 from __future__ import annotations
 
+import json
+
 from sqlalchemy import select
 
 from app import models
@@ -58,6 +60,33 @@ def suggest_settlement(
     return None
 
 
+def learn_person(session, name: str, alias: str | None = None) -> models.Person:
+    """Auto-learn a person on first group expense / settlement (Section 6.1).
+
+    The known-persons list must never go stale: any explicit counterparty we
+    create a receivable for (or settle with) becomes a known person, and the
+    merchant/VPA is kept as an alias for future classification.
+    """
+    key = (name or "").strip().lower()
+    if not key:
+        raise ValueError("person name required")
+    person = session.execute(
+        select(models.Person).where(models.Person.name == key)
+    ).scalars().first()
+    if person is None:
+        person = models.Person(name=key, vpas="[]", aliases="[]")
+        session.add(person)
+    if alias:
+        alias = alias.strip().lower()
+        if alias:
+            aliases = json.loads(person.aliases or "[]")
+            if alias not in aliases:
+                aliases.append(alias)
+                person.aliases = json.dumps(aliases)
+    session.flush()
+    return person
+
+
 def create_group_expense(
     session,
     transaction,
@@ -95,6 +124,7 @@ def create_group_expense(
     session.add(ge)
     transaction.txn_state = "flagged_shared"
     session.add(transaction)
+    learn_person(session, person, alias=transaction.counterparty_norm)
     session.flush()  # assign ge.id
     return ge
 
@@ -123,6 +153,8 @@ def apply_settlement(session, transaction, group_expense, amount_paise=None) -> 
     transaction.credit_type = "reimbursement"
     transaction.txn_state = "resolved_shared"
     transaction.status = "confirmed"
+
+    learn_person(session, group_expense.person, alias=transaction.counterparty_norm)
 
     session.add(group_expense)
     session.add(transaction)

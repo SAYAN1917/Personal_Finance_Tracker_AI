@@ -82,4 +82,40 @@ def link_refund(
     credit.txn_state = "resolved_shared" if original.txn_state == "flagged_shared" else "personal"
     credit.status = "confirmed"
     session.add(credit)
+    _reduce_receivables(session, credit, original)
     return link
+
+
+def _reduce_receivables(
+    session,
+    credit: models.Transaction,
+    original: models.Transaction,
+) -> None:
+    """FINAL_PLAN.md 10.1: a merchant refund of a shared expense reduces the
+    receivable (open/partial group expenses on the original) by the refund
+    amount. The refund is recorded as a Settlement(kind='refund') for the
+    money trail - no new receivable, no cash settlement."""
+    amount = abs(credit.amount_paise)
+    if amount <= 0:
+        return
+    rows = session.execute(
+        select(models.GroupExpense).where(
+            models.GroupExpense.transaction_id == original.id,
+            models.GroupExpense.status.in_(("open", "partial")),
+        )
+    ).scalars().all()
+    for ge in rows:
+        ge.received_so_far += amount
+        if ge.expected_receivable and ge.received_so_far >= ge.expected_receivable:
+            ge.status = "settled"
+        else:
+            ge.status = "partial"
+        session.add(ge)
+        session.add(
+            models.Settlement(
+                txn_id=credit.id,
+                group_expense_id=ge.id,
+                amount=amount,
+                kind="refund",
+            )
+        )

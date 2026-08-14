@@ -18,6 +18,7 @@ import httpx
 from sqlalchemy import select
 
 from app import db, models
+from app.audit import audit
 from app.config import settings
 from app.ingest import ingest
 from app.settlements import apply_settlement, create_group_expense
@@ -157,6 +158,16 @@ class TelegramBot:
         person, share_str = m.group(1), m.group(2)
         share_paise = round(float(share_str) * 100) if share_str else None
         ge = create_group_expense(session, txn, person, share_paise)
+        audit(
+            session,
+            "bot",
+            "group_expense",
+            "group_expense",
+            ge.id,
+            before=f"txn #{txn.id} flagged_shared",
+            after=f"receivable {ge.expected_receivable}",
+            reason=f"person={ge.person}",
+        )
         if ge.share_amount is None:
             note = "share unknown - receivable computed at settlement"
         else:
@@ -182,6 +193,7 @@ class TelegramBot:
                 "/status - this month's summary\n"
                 "/month - monthly digest\n"
                 "/bills - bills due in next 3 days\n"
+                "/person <name> - add a known person\n"
                 "/test - try a sample transaction",
             )
         elif cmd == "/balances":
@@ -195,6 +207,17 @@ class TelegramBot:
             self._send_monthly(chat_id)
         elif cmd == "/bills":
             self._send_due_bills(chat_id)
+        elif cmd == "/person":
+            name = " ".join(parts[1:]).strip()
+            if not name:
+                self.send_message(chat_id, "Usage: /person <name>\ne.g. /person sam")
+                return
+            with db.session_scope() as session:
+                from app.settlements import learn_person
+
+                learn_person(session, name)
+                session.commit()
+            self.send_message(chat_id, f"Added {name} to known persons.")
         elif cmd == "/test":
             self._ingest_text(
                 chat_id,
@@ -232,10 +255,25 @@ class TelegramBot:
                 return
 
             if result.outcome == "WEAK":
+                if result.duplicate_of is None:
+                    self.send_message(
+                        chat_id,
+                        "Possible duplicate - stored with needs_review (not merged). "
+                        "Use /find or /status to inspect it.",
+                    )
+                    return
+                markup = {
+                    "inline_keyboard": [[
+                        {"text": "Merge", "callback_data": f"weakmerge:{txn.id}:{result.duplicate_of.id}"},
+                        {"text": "No", "callback_data": f"weakkeep:{txn.id}"},
+                    ]]
+                }
                 self.send_message(
                     chat_id,
-                    "Possible duplicate - stored with needs_review (not merged). "
-                    "Use /find or /status to inspect it.",
+                    f"Possible duplicate of #{result.duplicate_of.id} "
+                    f"({abs(result.duplicate_of.amount_paise) / 100:.0f} {result.duplicate_of.counterparty_norm}). "
+                    "Merge into it, or keep as a separate transaction?",
+                    reply_markup=markup,
                 )
                 return
 
@@ -261,6 +299,14 @@ class TelegramBot:
 
             if txn.credit_type == "income":
                 self.send_message(chat_id, "Incoming credit recorded (income/reimbursement?).")
+                return
+
+            if txn.category == "transfer":
+                self.send_message(
+                    chat_id,
+                    f"Transfer recorded (not spend): Rs {abs(txn.amount_paise) / 100:.0f} "
+                    f"{txn.counterparty_norm or ''}".rstrip(),
+                )
                 return
 
             # Trigger-driven shared prompt (Section 7.3)
@@ -294,6 +340,8 @@ class TelegramBot:
     def _should_prompt_shared(self, txn: models.Transaction) -> bool:
         if settings.ask_everything:
             return True
+        if txn.category == "transfer":
+            return False
         amount = abs(txn.amount_paise) / 100
         # Odd/non-rounded, known persons, shared categories, above threshold
         if not float(amount).is_integer():
@@ -327,6 +375,38 @@ class TelegramBot:
         elif data.startswith("settle_no:"):
             _, txn_id = data.split(":")
             self.send_message(chat_id, f"Noted - transaction #{txn_id} is not a settlement.")
+        elif data.startswith("weakmerge:"):
+            _, incoming_id, canonical_id = data.split(":")
+            self._on_weak_merge(chat_id, int(incoming_id), int(canonical_id))
+        elif data.startswith("weakkeep:"):
+            _, incoming_id = data.split(":")
+            self._on_weak_keep(chat_id, int(incoming_id))
+
+    def _on_weak_merge(self, chat_id: int, incoming_id: int, canonical_id: int):
+        with db.session_scope() as session:
+            incoming = session.get(models.Transaction, incoming_id)
+            canonical = session.get(models.Transaction, canonical_id)
+            if not incoming or not canonical:
+                self.send_message(chat_id, "Transaction not found - it may have been merged already.")
+                return
+            from app.dedup import merge_transaction
+
+            merge_transaction(session, incoming, canonical)
+            audit(session, "bot", "merge", "transaction", incoming.id, before="review", after=f"merged into #{canonical.id}")
+            session.commit()
+            self.send_message(chat_id, f"Merged into #{canonical_id}.")
+
+    def _on_weak_keep(self, chat_id: int, incoming_id: int):
+        with db.session_scope() as session:
+            txn = session.get(models.Transaction, incoming_id)
+            if not txn:
+                self.send_message(chat_id, "Transaction not found.")
+                return
+            txn.needs_review = False
+            txn.status = "pending"
+            audit(session, "bot", "merge_no", "transaction", txn.id, before="needs_review", after="kept distinct")
+            session.commit()
+            self.send_message(chat_id, f"Kept #{txn.id} as a distinct transaction.")
 
     def _on_shared_answer(self, chat_id: int, txn_id: int, shared: bool):
         with db.session_scope() as session:
@@ -337,6 +417,7 @@ class TelegramBot:
             if shared:
                 txn.txn_state = "flagged_shared"
                 txn.needs_review = False
+                audit(session, "bot", "shared_prompt", "transaction", txn.id, before="personal", after="flagged_shared")
                 markup = {
                     "inline_keyboard": [[
                         {"text": "Create group expense", "callback_data": f"mkgroup:{txn_id}"},
@@ -352,6 +433,7 @@ class TelegramBot:
             else:
                 txn.txn_state = "personal"
                 txn.needs_review = False
+                audit(session, "bot", "shared_prompt", "transaction", txn.id, before="flagged_shared", after="personal")
                 self.send_message(chat_id, "Marked personal.")
             session.commit()
 
@@ -363,6 +445,16 @@ class TelegramBot:
                 self.send_message(chat_id, "Transaction or group expense not found.")
                 return
             state = apply_settlement(session, txn, ge)
+            audit(
+                session,
+                "bot",
+                "settle",
+                "settlement",
+                txn.id,
+                before="pending",
+                after=f"applied {state['applied']}",
+                reason=f"ge #{ge.id}",
+            )
             session.commit()
             self.send_message(
                 chat_id,

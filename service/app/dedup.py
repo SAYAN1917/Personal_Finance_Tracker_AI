@@ -142,3 +142,30 @@ class DedupEngine:
         if len(sources) >= 2 and canonical.status == "pending":
             canonical.status = "confirmed"
         return canonical
+
+
+def merge_transaction(session, incoming: models.Transaction, canonical: models.Transaction) -> models.Transaction:
+    """Human-confirmed merge of a stored WEAK/review txn into the canonical row.
+
+    Records provenance in dedup_map, folds the incoming sources into the
+    canonical row, and removes the duplicate (Section 5.4 '[Merge]').
+    """
+    for source in json.loads(incoming.sources or "[]"):
+        canonical.sources = _add_source_alias(canonical.sources, source)
+    if not canonical.utr and incoming.utr:
+        canonical.utr = incoming.utr
+    if not canonical.account and incoming.account:
+        canonical.account = incoming.account
+    if not canonical.counterparty_norm and incoming.counterparty_norm:
+        canonical.counterparty_norm = incoming.counterparty_norm
+    if not canonical.txn_date and incoming.txn_date:
+        canonical.txn_date = incoming.txn_date
+
+    sources = json.loads(canonical.sources)
+    if len(sources) >= 2 and canonical.status == "pending":
+        canonical.status = "confirmed"
+
+    session.add(models.DedupMap(canonical_id=canonical.id, source="manual_merge", raw_id=str(incoming.id)))
+    session.delete(incoming)
+    session.add(canonical)
+    return canonical

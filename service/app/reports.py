@@ -42,6 +42,7 @@ def category_spend(
             models.Transaction.txn_date >= start,
             models.Transaction.txn_date < end,
             models.Transaction.category.isnot(None),
+            models.Transaction.category != "transfer",
         )
         .group_by(models.Transaction.category)
     ).all()
@@ -62,6 +63,7 @@ def monthly_digest(session, year: int, month: int) -> dict:
             models.Transaction.ownership == "mine",
             models.Transaction.txn_date >= start,
             models.Transaction.txn_date < end,
+            models.Transaction.category != "transfer",
         )
     ).scalar_one()
     income = session.execute(
@@ -80,6 +82,7 @@ def monthly_digest(session, year: int, month: int) -> dict:
             models.Transaction.ownership == "mine",
             models.Transaction.txn_date >= start,
             models.Transaction.txn_date < end,
+            models.Transaction.category != "transfer",
         )
     ).scalar_one()
 
@@ -149,3 +152,38 @@ def mark_recurring_seen(session, rec: models.Recurring, txn: models.Transaction)
         txn.category = rec.category or "bills"
     session.add(rec)
     session.add(txn)
+
+
+def match_recurring(
+    session,
+    txn: models.Transaction,
+    tolerance_paise: int = 500,
+) -> models.Recurring | None:
+    """Find the single recurring bill a NEW debit matches (Section 11.3).
+
+    Conservative matching: expected amount within tolerance + merchant
+    containment (when the bill defines one) + day-of-month within +/-2 days.
+    Returns None when zero or multiple candidates match.
+    """
+    if txn.type != "debit":
+        return None
+    amount = abs(txn.amount_paise)
+    merchant = (txn.counterparty_norm or "").strip().lower()
+    day = txn.txn_date.day
+    matches = []
+    rows = session.execute(
+        select(models.Recurring).where(models.Recurring.active == True)  # noqa: E712
+    ).scalars().all()
+    for rec in rows:
+        if abs(rec.expected_amount - amount) > tolerance_paise:
+            continue
+        rec_merchant = (rec.merchant or "").strip().lower()
+        if rec_merchant:
+            if not merchant or not (rec_merchant in merchant or merchant in rec_merchant):
+                continue
+        if rec.day_of_month is not None and abs(rec.day_of_month - day) > 2:
+            continue
+        matches.append(rec)
+    if len(matches) == 1:
+        return matches[0]
+    return None
