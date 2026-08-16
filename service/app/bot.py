@@ -88,6 +88,8 @@ class TelegramBot:
         for update in data.get("result", []):
             self._offset = update["update_id"] + 1
             self._handle_update(update)
+        # Flush batched SMS-forward confirmations at the end of the poll batch.
+        self._flush_all_debounced()
 
     def _handle_update(self, update: dict):
         try:
@@ -248,6 +250,13 @@ class TelegramBot:
 
             txn = result.transaction
 
+            # NLU enrichment (Section 6.3): a partially-parsed NEW free-text
+            # entry can still be enriched - category when rules left it
+            # unknown, or a group_expense intent ('dinner 450 sam').
+            if result.outcome == "NEW" and source == "telegram" and txn is not None:
+                if self._enrich_nlu(session, chat_id, text, txn):
+                    return
+
             if result.outcome == "FAILED":
                 self.send_message(chat_id, f"Could not parse that. Example: 'dinner 450'. ({text[:60]})")
                 return
@@ -300,14 +309,24 @@ class TelegramBot:
                 return
 
             if txn.credit_type == "income":
-                self.send_message(chat_id, "Incoming credit recorded (income/reimbursement?).")
+                self._confirm(chat_id, "Incoming credit recorded (income/reimbursement?).", text)
                 return
 
             if txn.category == "transfer":
-                self.send_message(
+                self._confirm(
                     chat_id,
                     f"Transfer recorded (not spend): Rs {abs(txn.amount_paise) / 100:.0f} "
                     f"{txn.counterparty_norm or ''}".rstrip(),
+                    text,
+                )
+                return
+
+            if txn.category == "emi":
+                self._confirm(
+                    chat_id,
+                    f"EMI recorded (excluded from spend): Rs {abs(txn.amount_paise) / 100:.0f} "
+                    f"{txn.counterparty_norm or ''}".rstrip(),
+                    text,
                 )
                 return
 
@@ -333,26 +352,26 @@ class TelegramBot:
                     reply_markup=markup,
                 )
             else:
-                self.send_message(
+                self._confirm(
                     chat_id,
                     f"Recorded: Rs {abs(txn.amount_paise) / 100:.0f} {txn.counterparty_norm} "
                     f"[{txn.category or 'uncategorized'}]",
+                    text,
                 )
 
     def _should_prompt_shared(self, txn: models.Transaction) -> bool:
         if settings.ask_everything:
             return True
-        if txn.category == "transfer":
+        if txn.category in ("transfer", "emi"):
             return False
-        amount = abs(txn.amount_paise) / 100
-        # Odd/non-rounded, known persons, shared categories, above threshold
-        if not float(amount).is_integer():
-            return True
-        if txn.category in ("shared", "food", "groceries", "entertainment", "rent"):
-            return True
-        if amount >= settings.shared_prompt_threshold:
-            return True
-        return False
+        from app.classify import is_shared_heuristic
+
+        return is_shared_heuristic(
+            txn.amount_paise,
+            txn.counterparty_norm or "",
+            txn.category,
+            settings.shared_prompt_threshold,
+        )
 
     # ---------- Callback handling (inline keyboards) ----------
 
@@ -483,6 +502,49 @@ class TelegramBot:
             session.add(pa)
             session.commit()
 
+    def _enrich_nlu(self, session, chat_id: int, text: str, txn: models.Transaction) -> bool:
+        """Section 6.3: enrich a partially-parsed NEW free-text entry.
+
+        Returns True when the message was fully handled here (group expense),
+        False to let the normal NEW dispatch continue.
+        """
+        from app.nlu import parse_with_llm
+
+        nlu = parse_with_llm(text)
+        if not nlu:
+            return False
+
+        # Category: only fill when rules left it unknown - never override.
+        category = nlu.get("category")
+        if category and category != "unknown" and txn.category is None:
+            txn.category = category
+            session.add(txn)
+
+        # Group expense intent: 'dinner 450 sam' -> flag shared + receivable.
+        if nlu.get("intent") == "group_expense" and nlu.get("person"):
+            txn.txn_state = "flagged_shared"
+            txn.needs_review = False
+            session.add(txn)
+            session.commit()
+            person = nlu.get("person")
+            share = nlu.get("share_paise")
+            if person and share:
+                from app.settlements import create_group_expense
+
+                ge = create_group_expense(session, txn, person, share)
+                session.commit()
+                self.send_message(
+                    chat_id,
+                    f"Group expense #{ge.id}: {ge.person} owes Rs {ge.expected_receivable / 100:.0f} "
+                    f"(full {ge.full_amount / 100:.0f}).",
+                )
+            else:
+                self._on_mkgroup(chat_id, txn.id)
+            return True
+
+        session.commit()
+        return False
+
     def _rebuild_for_rules(self, text: str, nlu: dict) -> str:
         """Translate NLU output into canonical text the deterministic parser
         understands. The NLU never creates transactions directly.
@@ -603,17 +665,38 @@ class TelegramBot:
 
     # ---------- Debounce (Section 9.3) - SMS floods ----------
 
-    async def _debounced_flush(self, chat_id: int):
+    @staticmethod
+    def _looks_like_sms(text: str) -> bool:
+        t = text.lower()
+        return ("rs" in t or "inr" in t or "₹" in t) and (
+            "debited" in t or "credited" in t or "ref" in t
+        )
+
+    def _confirm(self, chat_id: int, text: str, source_text: str):
+        """Send a plain confirmation, batched when it's a forwarded SMS."""
+        if self._looks_like_sms(source_text):
+            self.queue_debounced(chat_id, text)
+        else:
+            self.send_message(chat_id, text)
+
+    def _flush_all_debounced(self):
+        chats = {chat_id for chat_id, _ in self._pending_queue}
+        for chat_id in chats:
+            self._debounced_flush(chat_id)
+
+    def _debounced_flush(self, chat_id: int):
         if not self._pending_queue:
             return
-        messages = self._pending_queue
-        self._pending_queue = []
-        text = "\n".join(messages)
+        to_flush = [text for c, text in self._pending_queue if c == chat_id]
+        if not to_flush:
+            return
+        self._pending_queue = [(c, t) for c, t in self._pending_queue if c != chat_id]
+        text = "\n".join(f"- {m}" for m in to_flush)
         self.send_message(chat_id, text)
 
     def queue_debounced(self, chat_id: int, text: str):
         """Called by the SMS-forwarding path to batch flood messages."""
-        self._pending_queue.append(text)
+        self._pending_queue.append((chat_id, text))
 
 
 def run_bot_forever():

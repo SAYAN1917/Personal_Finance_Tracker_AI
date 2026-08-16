@@ -21,6 +21,8 @@ dev = [
 
 [project.scripts]
 finance-bot = "app.bot:run_bot_forever"
+finance-digest = "app.digest:run"
+finance-email-poller = "app.email_poller:run"
 
 [tool.setuptools.packages.find]
 include = ["app*"]

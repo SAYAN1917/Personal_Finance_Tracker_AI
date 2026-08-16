@@ -6,7 +6,7 @@ from datetime import datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import db, models
@@ -139,10 +139,16 @@ def list_transactions(
 def ledger(
     session: Session = Depends(get_session),
     include_flagged: bool = Query(default=True),
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
 ):
-    rows = session.execute(
-        select(models.Transaction).order_by(models.Transaction.id)
-    ).scalars().all()
+    query = select(models.Transaction).order_by(models.Transaction.id)
+    if not include_flagged:
+        query = query.where(models.Transaction.txn_state != "flagged_shared")
+    total = session.execute(
+        select(func.count()).select_from(query.subquery())
+    ).scalar_one()
+    rows = session.execute(query.offset(offset).limit(limit) if limit else query.offset(offset)).scalars().all()
     data = []
     for t in rows:
         data.append(
@@ -159,7 +165,7 @@ def ledger(
                 "credit_type": t.credit_type,
             }
         )
-    return data
+    return {"total": total, "offset": offset, "limit": limit, "items": data}
 
 
 @app.post("/webhook/shared-prompt")

@@ -8,11 +8,13 @@ the statement balance. Any diff is surfaced, never silently fixed.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 
 from app import models
+
+_MATCH_DATE_WINDOW_DAYS = 3
 
 
 def ledger_delta(
@@ -124,3 +126,82 @@ def confidence_report(session) -> dict:
         )
     ).scalar_one()
     return {"status_counts": counts, "needs_review": needs_review}
+
+
+def reconcile_statement_lines(
+    session,
+    account_name: str,
+    lines: list[dict],
+    as_of: datetime | None = None,
+) -> dict:
+    """Match raw statement lines against the ledger (Section 10).
+
+    Each line: {"amount_paise": signed paise, "date": datetime,
+                "counterparty": str optional}.
+
+    NEVER mutates the ledger. Surfaces, for human review:
+      - `missing`: statement lines with no ledger match (we missed a txn)
+      - `anomalies`: ledger txns not matched by any statement line
+    A single unique match (signed amount + date window + counterparty
+    containment when available) wins; ambiguous lines stay unmatched.
+    """
+    as_of = as_of or datetime.now()
+    lo = as_of - timedelta(days=_MATCH_DATE_WINDOW_DAYS)
+
+    ledger = list(
+        session.execute(
+            select(models.Transaction).where(
+                models.Transaction.account == account_name,
+                models.Transaction.lifecycle == "active",
+                models.Transaction.txn_date >= lo,
+                models.Transaction.txn_date <= as_of,
+            )
+        ).scalars().all()
+    )
+
+    matched: list[int] = []
+    missing: list[dict] = []
+    for line in lines:
+        amount = line.get("amount_paise")
+        line_date = line.get("date")
+        if amount is None or line_date is None:
+            missing.append(line)
+            continue
+        cands = [
+            t
+            for t in ledger
+            if t.id not in matched
+            and t.amount_paise == amount
+            and abs((t.txn_date - line_date).days) <= _MATCH_DATE_WINDOW_DAYS
+        ]
+        if not cands:
+            missing.append(line)
+            continue
+        # Prefer the single candidate with counterparty containment
+        merchant = (line.get("counterparty") or "").strip().lower()
+        by_merchant = [
+            t
+            for t in cands
+            if merchant
+            and (merchant in t.counterparty_norm or t.counterparty_norm in merchant)
+        ]
+        best = by_merchant if len(by_merchant) == 1 else (cands if len(cands) == 1 else None)
+        if best is None:
+            missing.append(line)  # ambiguous - human decides
+            continue
+        matched.append(best[0].id)
+
+    anomalies = [t for t in ledger if t.id not in matched]
+    return {
+        "account": account_name,
+        "matched": matched,
+        "missing": missing,
+        "anomalies": [
+            {"id": t.id, "amount_paise": t.amount_paise, "date": t.txn_date.isoformat(), "counterparty": t.counterparty_norm}
+            for t in anomalies
+        ],
+        "matched_count": len(matched),
+        "missing_count": len(missing),
+        "anomaly_count": len(anomalies),
+        "note": "Statement diff is a flag for review, never an auto-fix",
+    }

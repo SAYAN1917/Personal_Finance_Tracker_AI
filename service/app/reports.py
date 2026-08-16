@@ -42,7 +42,7 @@ def category_spend(
             models.Transaction.txn_date >= start,
             models.Transaction.txn_date < end,
             models.Transaction.category.isnot(None),
-            models.Transaction.category != "transfer",
+            models.Transaction.category.notin_(["transfer", "emi"]),
         )
         .group_by(models.Transaction.category)
     ).all()
@@ -63,7 +63,7 @@ def monthly_digest(session, year: int, month: int) -> dict:
             models.Transaction.ownership == "mine",
             models.Transaction.txn_date >= start,
             models.Transaction.txn_date < end,
-            models.Transaction.category != "transfer",
+            models.Transaction.category.notin_(["transfer", "emi"]),
         )
     ).scalar_one()
     income = session.execute(
@@ -82,7 +82,7 @@ def monthly_digest(session, year: int, month: int) -> dict:
             models.Transaction.ownership == "mine",
             models.Transaction.txn_date >= start,
             models.Transaction.txn_date < end,
-            models.Transaction.category != "transfer",
+            models.Transaction.category.notin_(["transfer", "emi"]),
         )
     ).scalar_one()
 

@@ -13,7 +13,7 @@ from datetime import datetime
 from sqlalchemy import select
 
 from app import models
-from app.classify import classify_category, is_transfer
+from app.classify import classify_category, is_emi, is_transfer
 from app.dedup import DedupEngine
 from app.parser import PARSERS, ParsedTxn
 from app.settlements import suggest_settlement
@@ -179,6 +179,15 @@ def _classify_new(session, parsed: ParsedTxn, txn: models.Transaction, result: I
         txn.category = "transfer"
         txn.txn_state = "personal"
         result.message = f"Transfer (not spend): Rs {abs(txn.amount_paise) / 100:.0f}"
+        return
+
+    if is_emi(parsed.counterparty):
+        from app.classify import emi_group
+
+        txn.category = "emi"
+        txn.emi_group = emi_group(parsed.counterparty)
+        txn.txn_state = "personal"
+        result.message = f"EMI recorded (excluded from spend): Rs {abs(txn.amount_paise) / 100:.0f}"
         return
 
     category = classify_category(parsed.counterparty, known_persons)

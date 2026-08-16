@@ -83,6 +83,15 @@ TRANSFER_PATTERNS = [
     r"\b(transfer to self|self transfer|own account|own a/c|between accounts|my other account)\b",
 ]
 
+# EMI / credit-line repayments (Section 6 edge cases 5/17/20). Repaying a loan
+# or credit line is NOT consumption spend. Conservative: explicit EMI / credit
+# line tokens only, so a normal 'slice' shopping payment is not misread.
+EMI_PATTERNS = [
+    r"\bemi\b",
+    r"\b(credit line|creditline|loan repayment)\b",
+    r"\b(bajaj finserv|zest money|zestmoney|lazypay)\b",
+]
+
 
 def is_known_person(counterparty: str, persons: list[str]) -> bool:
     if not counterparty:
@@ -122,6 +131,22 @@ def is_transfer(counterparty: str) -> bool:
         return False
     c = counterparty.strip().lower()
     return any(re.search(pattern, c) for pattern in TRANSFER_PATTERNS)
+
+
+def is_emi(counterparty: str) -> bool:
+    """True if the debit is an EMI / credit-line repayment (not consumption
+    spend). Tagged category 'emi' + emi_group so it can be grouped/excluded
+    (Section 6 edge cases 5/17/20)."""
+    if not counterparty:
+        return False
+    c = counterparty.strip().lower()
+    return any(re.search(pattern, c) for pattern in EMI_PATTERNS)
+
+
+def emi_group(counterparty: str) -> str:
+    """Stable group slug for EMIs (the normalized merchant, e.g. 'slice')."""
+    slug = re.sub(r"[^a-z0-9]+", "", (counterparty or "").strip().lower())
+    return slug[:32] or "emi"
 
 
 def is_shared_heuristic(

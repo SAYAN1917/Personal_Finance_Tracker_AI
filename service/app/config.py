@@ -38,6 +38,14 @@ class Settings:
         self.llm_base_url = os.getenv("USER_LLM_BASE_URL", "")
         self.llm_model = os.getenv("USER_LLM_MODEL", "")
 
+        self.email_imap_host = os.getenv("EMAIL_IMAP_HOST", "")
+        self.email_imap_user = os.getenv("EMAIL_IMAP_USER", "")
+        self.email_imap_password = os.getenv("EMAIL_IMAP_PASSWORD", "")
+        self.email_imap_query = os.getenv("EMAIL_IMAP_QUERY", "ALL")
+
+        self.digest_period = os.getenv("DIGEST_PERIOD", "daily")
+        self.digest_chat_id = os.getenv("DIGEST_CHAT_ID", "")
+
         self.rate_limit_per_min = int(os.getenv("RATE_LIMIT_PER_MIN", "0"))
         self.log_dir = os.getenv("LOG_DIR", "")
 

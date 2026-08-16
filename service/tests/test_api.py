@@ -60,8 +60,8 @@ def test_ingest_and_ledger(client):
     assert body["outcome"] == "NEW"
 
     ledger = client.get("/ledger").json()
-    assert len(ledger) == 1
-    assert ledger[0]["counterparty"] == "swiggy"
+    assert ledger["total"] == 1
+    assert ledger["items"][0]["counterparty"] == "swiggy"
 
 
 def test_group_expense_and_balance(client):
