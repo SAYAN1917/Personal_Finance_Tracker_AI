@@ -28,7 +28,14 @@ def test_health(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert body["db"] == "ok"
+
+
+def test_ready(client):
+    resp = client.get("/ready")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ready"
+    assert body["migrations"] == "up_to_date"
 
 
 def test_ingest_requires_auth(client):

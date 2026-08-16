@@ -3,11 +3,12 @@ Description=Finance Tracker Telegram Bot
 After=network.target finance-api.service
 
 [Service]
-WorkingDirectory=/workspace/service
-Environment=DATABASE_URL=postgresql://finance:change-me@localhost:5432/finance
-Environment=TELEGRAM_BOT_TOKEN=change-me
-Environment=ADMIN_USER_ID=
-ExecStart=/usr/bin/python3 -m app.bot
+# Secrets live in /etc/finance/finance.env (see service/.env.example).
+# Fill in real values there; do NOT commit secrets to the repo.
+EnvironmentFile=/etc/finance/finance.env
+Environment=FINANCE_ENV=prod
+WorkingDirectory=/opt/finance/service
+ExecStart=/opt/finance/.venv/bin/finance-bot
 Restart=always
 RestartSec=10
 

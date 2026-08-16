@@ -3,11 +3,14 @@ Description=Finance Tracker API
 After=network.target
 
 [Service]
-WorkingDirectory=/workspace/service
-Environment=DATABASE_URL=postgresql://finance:change-me@localhost:5432/finance
-Environment=WEBHOOK_SECRET=change-me
-Environment=ADMIN_USER_ID=
-ExecStart=/usr/bin/python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+# Secrets live in /etc/finance/finance.env (see service/.env.example).
+# Fill in real values there; do NOT commit secrets to the repo.
+EnvironmentFile=/etc/finance/finance.env
+Environment=FINANCE_ENV=prod
+WorkingDirectory=/opt/finance/service
+# Apply schema migrations before starting.
+ExecStartPre=/opt/finance/.venv/bin/alembic upgrade head
+ExecStart=/opt/finance/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 

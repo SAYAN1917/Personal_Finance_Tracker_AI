@@ -21,6 +21,7 @@ from app import db, models
 from app.audit import audit
 from app.config import settings
 from app.ingest import ingest
+from app.logging import setup_logging
 from app.settlements import apply_settlement, create_group_expense
 
 logger = logging.getLogger(__name__)
@@ -62,8 +63,9 @@ class TelegramBot:
     # ---------- Security: allowlist (Section 13) ----------
 
     def _is_allowed(self, user_id: int) -> bool:
+        # Fail closed: no allowlist configured => reject everyone.
         if not settings.admin_user_id:
-            return True  # dev mode - open
+            return False
         allowed = {int(x) for x in settings.admin_user_id.split(",") if x.strip()}
         return user_id in allowed
 
@@ -616,9 +618,13 @@ class TelegramBot:
 
 def run_bot_forever():
     """Entry point - long-polls until interrupted."""
+    setup_logging("bot")
+    settings.validate(require_bot=True)  # fail fast on missing prod secrets
     if not settings.telegram_bot_token:
         logger.warning("TELEGRAM_BOT_TOKEN not set - bot disabled.")
         return
+    if not settings.admin_user_id:
+        logger.warning("ADMIN_USER_ID not set - bot will reject ALL users (fail closed).")
     bot = TelegramBot(settings.telegram_bot_token)
     logger.info("Telegram bot polling started")
     while True:
@@ -633,5 +639,4 @@ def run_bot_forever():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     run_bot_forever()

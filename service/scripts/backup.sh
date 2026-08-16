@@ -1,28 +1,18 @@
 #!/usr/bin/env bash
 # Nightly backup: dump the DB, compress, send to your Telegram Saved Messages.
+# Supports both sqlite (via .backup) and postgres (via pg_dump).
 # Usage: TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy ./scripts/backup.sh
 # Schedule with cron: 0 3 * * * /workspace/service/scripts/backup.sh
 # Restore (sqlite3 .backup produces a binary file, NOT a SQL dump):
 #   gunzip -c backup.sql.gz > /tmp/finance.backup
 #   sqlite3 finance.db ".restore '/tmp/finance.backup'"
+# Restore (postgres):
+#   gunzip -c finance-<stamp>.sql.gz | psql "$DATABASE_URL"
 
 set -euo pipefail
 
 SERVICE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DB_PATH="${DATABASE_URL:-sqlite:///$SERVICE_DIR/finance.db}"
-
-# Translate DATABASE_URL into a plain sqlite path
-if [[ "$DB_PATH" == sqlite:///* ]]; then
-    DB_FILE="${DB_PATH#sqlite:///}"
-else
-    echo "Only sqlite backups supported by this script." >&2
-    exit 1
-fi
-
-if [[ ! -f "$DB_FILE" ]]; then
-    echo "No database at $DB_FILE - nothing to back up." >&2
-    exit 1
-fi
+DB_URL="${DATABASE_URL:-sqlite:///$SERVICE_DIR/finance.db}"
 
 TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -36,10 +26,22 @@ STAMP="$(date +%Y%m%d-%H%M)"
 DUMP="$TMP_DIR/finance-$STAMP.sql"
 GZIP="$TMP_DIR/finance-$STAMP.sql.gz"
 
-# Note: not enabling WAL or live-mode here; the app uses SQLite so a plain
-# .dump is safe enough for a nightly snapshot. For Postgres this becomes
-# `pg_dump finance | gzip`.
-sqlite3 "$DB_FILE" ".backup '$DUMP'"
+if [[ "$DB_URL" == postgres* ]]; then
+    # PGPASSWORD can be passed separately to avoid the password in DATABASE_URL.
+    pg_dump "$DB_URL" > "$DUMP"
+elif [[ "$DB_URL" == sqlite:///* ]]; then
+    DB_FILE="${DB_URL#sqlite:///}"
+    if [[ ! -f "$DB_FILE" ]]; then
+        echo "No database at $DB_FILE - nothing to back up." >&2
+        exit 1
+    fi
+    # sqlite .backup is a binary copy, safe to take on a live DB.
+    sqlite3 "$DB_FILE" ".backup '$DUMP'"
+else
+    echo "Unsupported DATABASE_URL scheme: $DB_URL" >&2
+    exit 1
+fi
+
 gzip -c "$DUMP" > "$GZIP"
 SIZE="$(du -h "$GZIP" | cut -f1)"
 

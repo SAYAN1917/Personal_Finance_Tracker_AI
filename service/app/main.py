@@ -13,6 +13,8 @@ from app import db, models
 from app.audit import audit
 from app.config import settings
 from app.ingest import ingest
+from app.logging import setup_logging
+from app.ratelimit import enforce_rate_limit
 from app.schemas import (
     ConfirmMergeRequest,
     GroupExpenseRequest,
@@ -31,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    setup_logging("api")
+    settings.validate()  # fail fast on missing prod secrets
     db.init_db()
     logger.info("Database initialized")
     yield
@@ -63,18 +67,34 @@ def _check_webhook_secret(authorization: str | None, x_webhook_secret: str | Non
 
 @app.get("/health")
 def health():
-    """Liveness for UptimeRobot (Section 13). DB check included so a dead DB
-    surfaces quickly instead of weeks later."""
+    """Cheap liveness for UptimeRobot - does NOT do a full reconcile."""
     try:
-        db.init_db()
-        from app.reconcile import confidence_report
-
         with db.session_scope() as session:
-            report = confidence_report(session)
-        return {"status": "ok", "confidence": report["status_counts"], "db": "ok"}
+            session.execute(select(1))
+        return {"status": "ok"}
     except Exception as exc:  # noqa: BLE001
         logger.error("Health check failed: %s", exc)
         raise HTTPException(status_code=503, detail="db_down")
+
+
+@app.get("/ready")
+def ready():
+    """Readiness: DB reachable + migrations up to date. Heavy checks live here,
+    not in /health."""
+    try:
+        from app.db import check_migrations
+
+        with db.session_scope() as session:
+            session.execute(select(1))
+            migration_state = check_migrations(session)
+        if migration_state != "up_to_date":
+            raise HTTPException(status_code=503, detail="migrations_pending")
+        return {"status": "ready", "migrations": migration_state, "env": settings.environment}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Ready check failed: %s", exc)
+        raise HTTPException(status_code=503, detail="not_ready")
 
 
 @app.post("/webhook/ingest")
@@ -83,6 +103,7 @@ def webhook_ingest(
     session: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
     x_webhook_secret: str | None = Header(default=None),
+    _rate_limit: None = Depends(enforce_rate_limit),
 ):
     _check_webhook_secret(authorization, x_webhook_secret)
     result = ingest(session, req.source, req.text, req.channel or req.source)
@@ -147,6 +168,7 @@ def shared_prompt(
     session: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
     x_webhook_secret: str | None = Header(default=None),
+    _rate_limit: None = Depends(enforce_rate_limit),
 ):
     """Answer to 'is this shared?' - sets flagged_shared or confirms personal."""
     _check_webhook_secret(authorization, x_webhook_secret)
@@ -176,6 +198,7 @@ def confirm_merge(
     session: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
     x_webhook_secret: str | None = Header(default=None),
+    _rate_limit: None = Depends(enforce_rate_limit),
 ):
     """Human resolution for a WEAK dedup txn: [Merge] folds it into the
     canonical row, [No] keeps it as a distinct transaction."""
@@ -205,6 +228,7 @@ def create_group_expense(
     session: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
     x_webhook_secret: str | None = Header(default=None),
+    _rate_limit: None = Depends(enforce_rate_limit),
 ):
     """Create the receivable (flag != receivable; this is what makes it real)."""
     _check_webhook_secret(authorization, x_webhook_secret)
@@ -242,6 +266,7 @@ def settle(
     session: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
     x_webhook_secret: str | None = Header(default=None),
+    _rate_limit: None = Depends(enforce_rate_limit),
 ):
     _check_webhook_secret(authorization, x_webhook_secret)
     txn = session.get(models.Transaction, req.transaction_id)
@@ -381,6 +406,7 @@ def create_recurring(
     session: Session = Depends(get_session),
     authorization: str | None = Header(default=None),
     x_webhook_secret: str | None = Header(default=None),
+    _rate_limit: None = Depends(enforce_rate_limit),
 ):
     """Register a known recurring bill for reminders."""
     _check_webhook_secret(authorization, x_webhook_secret)
